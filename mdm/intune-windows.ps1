@@ -175,7 +175,7 @@ function Get-UserProfilePath {
 Write-Log "Starting Corridor MDM provisioning..."
 
 # Check if configuration is set
-if ($CORRIDOR_TEAM_TOKEN -eq "YOUR_TEAM_TOKEN_HERE" -or [string]::IsNullOrEmpty($CORRIDOR_TEAM_TOKEN)) {
+if ($CORRIDOR_TEAM_TOKEN -eq "cor-team_..." -or [string]::IsNullOrEmpty($CORRIDOR_TEAM_TOKEN)) {
     Write-Log "CORRIDOR_TEAM_TOKEN is not configured. Please set your team token." -Level ERROR
     exit 1
 }

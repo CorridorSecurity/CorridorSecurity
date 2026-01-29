@@ -62,7 +62,7 @@ get_current_user() {
 }
 
 # Check if configuration is set
-if [ "$CORRIDOR_TEAM_TOKEN" = "YOUR_TEAM_TOKEN_HERE" ] || [ -z "$CORRIDOR_TEAM_TOKEN" ]; then
+if [ "$CORRIDOR_TEAM_TOKEN" = "cor-team_..." ] || [ -z "$CORRIDOR_TEAM_TOKEN" ]; then
     log_error "CORRIDOR_TEAM_TOKEN is not configured. Please set your team token."
     exit 1
 fi
