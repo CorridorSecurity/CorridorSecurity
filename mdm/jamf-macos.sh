@@ -10,26 +10,22 @@
 # Configuration:
 #   CORRIDOR_TEAM_TOKEN - Your team's Universal Team Token (required)
 #
-# Jamf Pro Script Parameters (configure these in the Jamf Pro policy):
-#   $1 - Mount point of the target drive (reserved by Jamf Pro)
-#   $2 - Computer name (reserved by Jamf Pro)
-#   $3 - Username of the currently logged-in user (reserved by Jamf Pro)
-#   $4 - User's email address (set to "$EMAIL" in Jamf Pro policy)
-#   $5 - Device serial number (set to "$SERIALNUMBER" in Jamf Pro policy)
+# Device Configuration (via Jamf Pro configuration profile):
+#   This script reads device-specific values from a managed plist:
+#     /Library/Managed Preferences/dev.corridor.mdm.plist
+#   Keys:
+#     UserEmail    - The user's email address
+#     SerialNumber - The device serial number
 #
-# Jamf Pro Policy Setup:
+# Jamf Pro Setup:
 #   1. Get a Universal Team Token from your Corridor team settings
 #   2. Replace the CORRIDOR_TEAM_TOKEN value below with your token
-#   3. Add this script to Jamf Pro under Settings > Scripts
-#   4. Set Parameter Labels:
-#        Parameter 4 Label: "User Email"
-#        Parameter 5 Label: "Serial Number"
-#   5. Create a policy, add this script, and set parameter values:
-#        Parameter 4: $EMAIL
-#        Parameter 5: $SERIALNUMBER
-#   6. Scope the policy to your target computers
+#   3. Create a configuration profile that pushes a plist to
+#      /Library/Managed Preferences/dev.corridor.mdm.plist with
+#      the UserEmail and SerialNumber keys
+#   4. Add this script to Jamf Pro under Settings > Scripts
+#   5. Create a policy, add this script, and scope it to your target computers
 #
-
 # ============================================================================
 # CONFIGURATION - Replace with your actual values
 # ============================================================================
@@ -44,11 +40,9 @@ set -e
 LOG_PREFIX="[Corridor MDM]"
 CORRIDOR_API_URL="https://app.corridor.dev/api"
 
-# Jamf Pro script parameters ($1-$3 are reserved by Jamf Pro)
-# Parameter 4 Label: "User Email"       → set to "$EMAIL" in policy
-# Parameter 5 Label: "Serial Number"    → set to "$SERIALNUMBER" in policy
-JAMF_USER_EMAIL="${4}"
-JAMF_SERIAL_NUMBER="${5}"
+# Read device configuration from managed plist (pushed via Jamf Pro configuration profile)
+JAMF_USER_EMAIL=$(defaults read /Library/Managed\ Preferences/dev.corridor.mdm.plist UserEmail 2>/dev/null || echo "")
+JAMF_SERIAL_NUMBER=$(defaults read /Library/Managed\ Preferences/dev.corridor.mdm.plist SerialNumber 2>/dev/null || echo "")
 
 log_info() {
     echo "$LOG_PREFIX INFO: $1"
@@ -83,18 +77,18 @@ if [ "$CORRIDOR_TEAM_TOKEN" = "cor-team_..." ] || [ -z "$CORRIDOR_TEAM_TOKEN" ];
     exit 1
 fi
 
-# Set the device serial from Jamf Pro script parameter ($5 = $SERIALNUMBER)
+# Set the device serial from managed plist
 DEVICE_SERIAL="$JAMF_SERIAL_NUMBER"
 if [ -z "$DEVICE_SERIAL" ]; then
-    log_error "Could not retrieve device serial number. Ensure Parameter 5 is set to \$SERIALNUMBER in the Jamf Pro policy."
+    log_error "Could not retrieve device serial number. Ensure the configuration profile pushes SerialNumber to /Library/Managed Preferences/dev.corridor.mdm.plist."
     exit 1
 fi
 log_info "Device Serial: $DEVICE_SERIAL"
 
-# Set the user email from Jamf Pro script parameter ($4 = $EMAIL)
+# Set the user email from managed plist
 USER_EMAIL="$JAMF_USER_EMAIL"
 if [ -z "$USER_EMAIL" ]; then
-    log_error "Could not retrieve user email. Ensure Parameter 4 is set to \$EMAIL in the Jamf Pro policy."
+    log_error "Could not retrieve user email. Ensure the configuration profile pushes UserEmail to /Library/Managed Preferences/dev.corridor.mdm.plist."
     exit 1
 fi
 log_info "User email: $USER_EMAIL"
