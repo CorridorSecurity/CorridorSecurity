@@ -68,14 +68,14 @@ if [ "$CORRIDOR_TEAM_TOKEN" = "cor-team_..." ] || [ -z "$CORRIDOR_TEAM_TOKEN" ];
 fi
 
 # Set the device serial and the user email from Kandji global variables
-DEVICE_SERIAL=$(/usr/libexec/PlistBuddy -c 'print :SERIAL_NUMBER' /Library/Managed\ Preferences/io.kandji.globalvariables.plist)
+DEVICE_SERIAL=$(/usr/libexec/PlistBuddy -c 'print :SerialNumber' /Library/Managed\ Preferences/io.kandji.globalvariables.plist)
 if [ -z "$DEVICE_SERIAL" ]; then
     log_error "Could not retrieve device serial number"
     exit 1
 fi
 log_info "Device Serial: $DEVICE_SERIAL"
 
-USER_EMAIL=$(/usr/libexec/PlistBuddy -c 'print :EMAIL' /Library/Managed\ Preferences/io.kandji.globalvariables.plist)
+USER_EMAIL=$(/usr/libexec/PlistBuddy -c 'print :UserEmail' /Library/Managed\ Preferences/io.kandji.globalvariables.plist)
 if [ -z "$USER_EMAIL" ]; then
     log_error "Could not retrieve user email"
     exit 1
@@ -99,6 +99,7 @@ get_editor_app_name() {
         Cursor)   echo "Cursor.app" ;;
         VSCode)   echo "Visual Studio Code.app" ;;
         Windsurf) echo "Windsurf.app" ;;
+        *)        echo "" ;;
     esac
 }
 
@@ -108,6 +109,7 @@ get_editor_platform() {
         Cursor)   echo "cursor" ;;
         VSCode)   echo "vscode" ;;
         Windsurf) echo "windsurf" ;;
+        *)        echo "" ;;
     esac
 }
 
@@ -117,6 +119,7 @@ get_editor_cli() {
         Cursor)   echo "cursor" ;;
         VSCode)   echo "code" ;;
         Windsurf) echo "windsurf" ;;
+        *)        echo "" ;;
     esac
 }
 
@@ -139,9 +142,10 @@ get_editor_cli_path_alternative() {
 
 get_editor_ext_dir() {
     case "$1" in
-        Cursor)  echo ".cursor/extensions" ;;
-        VSCode)  echo ".vscode/extensions" ;;
+        Cursor)   echo ".cursor/extensions" ;;
+        VSCode)   echo ".vscode/extensions" ;;
         Windsurf) echo ".windsurf/extensions" ;;
+        *)        echo "" ;;
     esac
 }
 
@@ -188,14 +192,14 @@ for editor in $INSTALLED_EDITORS; do
 
     # Check if CLI path was resolved
     if [ -z "$CLI_PATH" ]; then
-        log_error "Unknown editor: $editor"
-        exit 1
+        log_error "Unknown editor: $editor — skipping"
+        continue
     fi
 
     # Check if CLI exists
     if [ ! -f "$CLI_PATH" ]; then
-        log_error "$editor CLI not found at $CLI_PATH"
-        exit 1
+        log_error "$editor CLI not found at $CLI_PATH — skipping"
+        continue
     fi
 
     log_info "Installing Corridor extension for $editor..."
@@ -213,8 +217,8 @@ for editor in $INSTALLED_EDITORS; do
         if ls "$EXT_DIR" 2>/dev/null | grep -qi "corridor"; then
             log_info "Corridor extension is already installed for $editor"
         else
-            log_error "Failed to install Corridor extension for $editor: $INSTALL_OUTPUT"
-            exit 1
+            log_error "Failed to install Corridor extension for $editor: $INSTALL_OUTPUT — skipping"
+            continue
         fi
     fi
 done
@@ -226,6 +230,11 @@ log_info "Provisioning user with Corridor..."
 
 for editor in $INSTALLED_EDITORS; do
     PLATFORM=$(get_editor_platform "$editor")
+    if [ -z "$PLATFORM" ]; then
+        log_error "No platform mapping for $editor — skipping provisioning"
+        continue
+    fi
+
     EDITOR_CONFIG_DIR="$CORRIDOR_CONFIG_DIR/$PLATFORM"
     CORRIDOR_PENDING_TOKEN_FILE="$EDITOR_CONFIG_DIR/pending-token"
 
@@ -235,14 +244,19 @@ for editor in $INSTALLED_EDITORS; do
         -H "Authorization: Bearer $CORRIDOR_TEAM_TOKEN" \
         -H "Content-Type: application/json" \
         -d "{\"deviceSerial\": \"$DEVICE_SERIAL\", \"userEmail\": \"$USER_EMAIL\", \"platform\": \"$PLATFORM\"}" \
-        "$CORRIDOR_API_URL/extension-auth/mdm-sync-device")
+        "$CORRIDOR_API_URL/extension-auth/mdm-sync-device") || true
+
+    if [ -z "$RESPONSE" ]; then
+        log_error "No response from Corridor API for $editor — skipping"
+        continue
+    fi
 
     HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
     BODY=$(echo "$RESPONSE" | sed '$d')
 
     if [ "$HTTP_CODE" != "200" ]; then
-        log_error "Failed to provision user for $editor. HTTP $HTTP_CODE: $BODY"
-        exit 1
+        log_error "Failed to provision user for $editor. HTTP $HTTP_CODE: $BODY — skipping"
+        continue
     fi
 
     # Extract API token and token ID from response
@@ -250,25 +264,32 @@ for editor in $INSTALLED_EDITORS; do
     API_TOKEN_ID=$(echo "$BODY" | grep -o '"apiTokenId":"[^"]*"' | cut -d'"' -f4)
 
     if [ -z "$API_TOKEN" ]; then
-        log_error "Could not extract API token from response for $editor"
-        exit 1
+        log_error "Could not extract API token from response for $editor — skipping"
+        continue
     fi
 
     # Create editor-specific config directory with proper permissions
-    sudo -u "$CURRENT_USER" mkdir -p "$EDITOR_CONFIG_DIR"
-    chmod 700 "$EDITOR_CONFIG_DIR"
+    if ! sudo -u "$CURRENT_USER" mkdir -p "$EDITOR_CONFIG_DIR"; then
+        log_error "Failed to create config directory $EDITOR_CONFIG_DIR for $editor — skipping"
+        continue
+    fi
+    chmod 700 "$EDITOR_CONFIG_DIR" || true
 
     # Write pending token file
-    sudo -u "$CURRENT_USER" cat > "$CORRIDOR_PENDING_TOKEN_FILE" << EOF
+    if ! sudo -u "$CURRENT_USER" bash -c "cat > '$CORRIDOR_PENDING_TOKEN_FILE'" << EOF
 {
   "apiToken": "$API_TOKEN",
   "apiTokenId": "$API_TOKEN_ID",
   "provisionedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 }
 EOF
+    then
+        log_error "Failed to write pending token file for $editor — skipping"
+        continue
+    fi
 
-    chmod 600 "$CORRIDOR_PENDING_TOKEN_FILE"
-    chown "$CURRENT_USER" "$CORRIDOR_PENDING_TOKEN_FILE"
+    chmod 600 "$CORRIDOR_PENDING_TOKEN_FILE" || true
+    chown "$CURRENT_USER" "$CORRIDOR_PENDING_TOKEN_FILE" || true
     log_info "Pending token for $editor stored in $CORRIDOR_PENDING_TOKEN_FILE"
 done
 
