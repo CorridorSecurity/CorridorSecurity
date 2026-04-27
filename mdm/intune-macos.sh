@@ -326,12 +326,14 @@ for editor in $INSTALLED_EDITORS; do
         exit 1
     fi
 
-    # Create editor-specific config directory with proper permissions
-    sudo -u "$CURRENT_USER" mkdir -p "$EDITOR_CONFIG_DIR"
-    chmod 700 "$EDITOR_CONFIG_DIR"
-
-    # Write pending token file
-    sudo -u "$CURRENT_USER" cat > "$CORRIDOR_PENDING_TOKEN_FILE" << EOF
+    # Create editor-specific config directory and write pending token file as root.
+    # The MDM script already runs as root, so we write directly and adjust ownership
+    # afterwards. The previous `sudo -u "$CURRENT_USER" cat > FILE << EOF` pattern
+    # relies on a redirect that runs in the root shell while `cat` runs as the
+    # target user, which fails silently on some managed devices and leaves the
+    # file uncreated (then `chmod 600` errors with "No such file or directory").
+    mkdir -p "$EDITOR_CONFIG_DIR"
+    cat > "$CORRIDOR_PENDING_TOKEN_FILE" << EOF
 {
   "apiToken": "$API_TOKEN",
   "apiTokenId": "$API_TOKEN_ID",
@@ -339,8 +341,9 @@ for editor in $INSTALLED_EDITORS; do
 }
 EOF
 
+    chmod 700 "$EDITOR_CONFIG_DIR"
     chmod 600 "$CORRIDOR_PENDING_TOKEN_FILE"
-    chown "$CURRENT_USER" "$CORRIDOR_PENDING_TOKEN_FILE"
+    chown -R "$CURRENT_USER" "$CORRIDOR_CONFIG_DIR"
     log_info "Pending token for $editor stored in $CORRIDOR_PENDING_TOKEN_FILE"
 done
 
