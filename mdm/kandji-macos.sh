@@ -254,7 +254,10 @@ for editor in $INSTALLED_EDITORS; do
         exit 1
     fi
 
+    # Create editor-specific config directory with proper permissions
     mkdir -p "$EDITOR_CONFIG_DIR"
+
+    # Write pending token file
     cat > "$CORRIDOR_PENDING_TOKEN_FILE" << EOF
 {
   "apiToken": "$API_TOKEN",
