@@ -254,17 +254,24 @@ for editor in $INSTALLED_EDITORS; do
         exit 1
     fi
 
-    # Create editor-specific config directory with proper permissions
-    mkdir -p "$EDITOR_CONFIG_DIR"
+    # Create editor-specific config directory and write pending token file.
+    # Use umask 077 in a subshell so the directory is born 700 and the file is
+    # born 600, ensuring the API token is never world-readable on disk.
+    (
+        umask 077
 
-    # Write pending token file
-    cat > "$CORRIDOR_PENDING_TOKEN_FILE" << EOF
+        # Create editor-specific config directory with proper permissions
+        mkdir -p "$EDITOR_CONFIG_DIR"
+
+        # Write pending token file
+        cat > "$CORRIDOR_PENDING_TOKEN_FILE" << EOF
 {
   "apiToken": "$API_TOKEN",
   "apiTokenId": "$API_TOKEN_ID",
   "provisionedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 }
 EOF
+    )
 
     chmod 700 "$EDITOR_CONFIG_DIR"
     chmod 600 "$CORRIDOR_PENDING_TOKEN_FILE"
