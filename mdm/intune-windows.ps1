@@ -44,6 +44,12 @@ $CORRIDOR_API_URL = "https://app.corridor.dev/api"
 # Force TLS 1.2+ (PowerShell 5.1 defaults to TLS 1.0/1.1)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
+# Make the editor's bundled Node trust the Windows system certificate store
+# so the extension marketplace fetch succeeds behind corporate TLS-inspecting
+# proxies (e.g. Zscaler) that inject a custom root CA. No-op on older Node
+# versions that don't recognize this variable.
+$env:NODE_USE_SYSTEM_CA = "1"
+
 function Write-Log {
     param(
         [string]$Message,
