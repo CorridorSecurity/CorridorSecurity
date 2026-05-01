@@ -211,13 +211,11 @@ for editor in $INSTALLED_EDITORS; do
 
     log_info "Installing Corridor extension for $editor..."
 
-    # Run as the logged-in user to ensure proper extension installation
-    # Capture output and exit code - "already installed" is not a failure
-    #
-    # NODE_USE_SYSTEM_CA=1 makes the editor's bundled Node trust the macOS
-    # system keychain so the extension marketplace fetch succeeds behind
-    # corporate TLS-inspecting proxies (e.g. Zscaler). `env` is required
-    # because sudo strips the environment by default.
+    # Run as the logged-in user to ensure proper extension installation.
+    # NODE_USE_SYSTEM_CA=1 makes the editor's bundled Node trust roots from the
+    # macOS System keychain in addition to its bundled CA list, which lets
+    # extension installs succeed behind TLS-intercepting corporate proxies
+    # (Zscaler, Netskope, Palo Alto, etc.) whose root CA is admin-trusted.
     INSTALL_OUTPUT=$(sudo -u "$CURRENT_USER" env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" --install-extension corridor.Corridor --force 2>&1) || true
 
     if echo "$INSTALL_OUTPUT" | grep -qi "already installed"; then
