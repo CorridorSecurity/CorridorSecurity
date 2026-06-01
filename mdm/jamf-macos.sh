@@ -101,6 +101,23 @@ if [ -z "$CURRENT_USER" ]; then
 fi
 log_info "Current User: $CURRENT_USER"
 
+# ============================================================================
+# Install the Corridor CLI
+# ============================================================================
+# Download and install the Corridor CLI for the logged-in user. The installer
+# places the binary under the user's ~/.corridor/bin and symlinks it into
+# ~/.local/bin, so it must run as the interactive user (not root) for HOME to
+# resolve correctly. Setting CI=1 skips the interactive Claude Code plugin
+# setup, which cannot run unattended in an MDM context.
+log_info "Installing the Corridor CLI for $CURRENT_USER..."
+
+if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" CI=1 \
+    bash -c 'curl -fsSL https://app.corridor.dev/cli/install.sh | bash'; then
+    log_success "Corridor CLI installed successfully"
+else
+    log_error "Failed to install the Corridor CLI (continuing with extension provisioning)"
+fi
+
 # Define supported editors (bash 3.x compatible - no associative arrays)
 EDITOR_NAMES="Cursor VSCode Windsurf"
 

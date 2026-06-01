@@ -11,6 +11,8 @@ These scripts automate the deployment of the Corridor extension to developer mac
 2. **Install the Corridor extension** - Use each editor's CLI to install the extension
 3. **Provision API tokens** - Create per-editor API tokens for the user and store them for the extension to pick up on next launch
 
+On macOS, the scripts also download and install the [Corridor CLI](https://app.corridor.dev/cli/install.sh) for the logged-in user (via `curl -fsSL https://app.corridor.dev/cli/install.sh | bash`).
+
 ## Available Scripts
 
 ### `intune-macos.sh` and `intune-windows.ps1`
