@@ -100,11 +100,64 @@ log_info "Current User: $CURRENT_USER"
 # setup, which cannot run unattended in an MDM context.
 log_info "Installing the Corridor CLI for $CURRENT_USER..."
 
+CORRIDOR_CONFIG_DIR="/Users/$CURRENT_USER/.corridor"
+CLI_INSTALLED="false"
+
 if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" CI=1 \
     bash -c 'set -o pipefail; curl -fsSL https://app.corridor.dev/cli/install.sh | bash'; then
     log_success "Corridor CLI installed successfully"
+    CLI_INSTALLED="true"
 else
     log_error "Failed to install the Corridor CLI (continuing with extension provisioning)"
+fi
+
+# Provision a token for the Corridor CLI so it is authenticated on first run.
+# This runs before editor detection (and the no-editor early exit) so the CLI
+# gets a token even on machines without a supported editor installed. The token
+# is written to the CLI's pending-token file for the CLI to pick up on launch.
+if [ "$CLI_INSTALLED" = "true" ]; then
+    CLI_CONFIG_DIR="$CORRIDOR_CONFIG_DIR/cli"
+    CLI_PENDING_TOKEN_FILE="$CLI_CONFIG_DIR/pending-token"
+
+    log_info "Creating API token for the Corridor CLI (cli)..."
+
+    CLI_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+        -H "Authorization: Bearer $CORRIDOR_TEAM_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"deviceSerial\": \"$DEVICE_SERIAL\", \"userEmail\": \"$USER_EMAIL\", \"platform\": \"cli\"}" \
+        "$CORRIDOR_API_URL/extension-auth/mdm-sync-device")
+
+    CLI_HTTP_CODE=$(echo "$CLI_RESPONSE" | tail -n1)
+    CLI_BODY=$(echo "$CLI_RESPONSE" | sed '$d')
+
+    if [ "$CLI_HTTP_CODE" != "200" ]; then
+        log_error "Failed to provision CLI token. HTTP $CLI_HTTP_CODE: $CLI_BODY (continuing)"
+    else
+        CLI_API_TOKEN=$(echo "$CLI_BODY" | grep -o '"apiToken":"[^"]*"' | cut -d'"' -f4)
+        CLI_API_TOKEN_ID=$(echo "$CLI_BODY" | grep -o '"apiTokenId":"[^"]*"' | cut -d'"' -f4)
+
+        if [ -z "$CLI_API_TOKEN" ]; then
+            log_error "Could not extract CLI API token from response (continuing)"
+        else
+            # Use umask 077 in a subshell so the directory is born 700 and the
+            # file is born 600, ensuring the API token is never world-readable.
+            (
+                umask 077
+                mkdir -p "$CLI_CONFIG_DIR"
+                cat > "$CLI_PENDING_TOKEN_FILE" << EOF
+{
+  "apiToken": "$CLI_API_TOKEN",
+  "apiTokenId": "$CLI_API_TOKEN_ID",
+  "provisionedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+            )
+            chmod 700 "$CLI_CONFIG_DIR"
+            chmod 600 "$CLI_PENDING_TOKEN_FILE"
+            chown -R "$CURRENT_USER" "$CORRIDOR_CONFIG_DIR"
+            log_success "Pending token for the Corridor CLI stored in $CLI_PENDING_TOKEN_FILE"
+        fi
+    fi
 fi
 
 # Define supported editors (bash 3.x compatible - no associative arrays)
@@ -237,8 +290,6 @@ for editor in $INSTALLED_EDITORS; do
 done
 
 # Provision user and create separate API tokens for each installed editor
-CORRIDOR_CONFIG_DIR="/Users/$CURRENT_USER/.corridor"
-
 log_info "Provisioning user with Corridor..."
 
 for editor in $INSTALLED_EDITORS; do
