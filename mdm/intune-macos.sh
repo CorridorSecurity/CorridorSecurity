@@ -164,7 +164,7 @@ log_info "User Email: $USER_EMAIL"
 log_info "Installing the Corridor CLI for $CURRENT_USER..."
 
 if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" CI=1 \
-    bash -c 'curl -fsSL https://app.corridor.dev/cli/install.sh | bash'; then
+    bash -c 'set -o pipefail; curl -fsSL https://app.corridor.dev/cli/install.sh | bash'; then
     log_success "Corridor CLI installed successfully"
 else
     log_error "Failed to install the Corridor CLI (continuing with extension provisioning)"
