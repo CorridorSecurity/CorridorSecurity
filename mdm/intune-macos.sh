@@ -163,9 +163,13 @@ log_info "User Email: $USER_EMAIL"
 # setup, which cannot run unattended in an MDM context.
 log_info "Installing the Corridor CLI for $CURRENT_USER..."
 
+CORRIDOR_CONFIG_DIR="/Users/$CURRENT_USER/.corridor"
+CLI_INSTALLED="false"
+
 if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" CI=1 \
     bash -c 'set -o pipefail; curl -fsSL https://app.corridor.dev/cli/install.sh | bash'; then
     log_success "Corridor CLI installed successfully"
+    CLI_INSTALLED="true"
 else
     log_error "Failed to install the Corridor CLI (continuing with extension provisioning)"
 fi
@@ -247,10 +251,23 @@ done
 # Trim leading space
 INSTALLED_EDITORS=$(echo "$INSTALLED_EDITORS" | sed 's/^ *//')
 
-# Exit if no editors are installed
+# Build the list of platforms to provision tokens for: the platform for each
+# installed editor, plus "cli" if the Corridor CLI installed successfully.
+PROVISION_PLATFORMS=""
+for editor in $INSTALLED_EDITORS; do
+    PROVISION_PLATFORMS="$PROVISION_PLATFORMS $(get_editor_platform "$editor")"
+done
+if [ "$CLI_INSTALLED" = "true" ]; then
+    PROVISION_PLATFORMS="$PROVISION_PLATFORMS cli"
+fi
+PROVISION_PLATFORMS=$(echo "$PROVISION_PLATFORMS" | sed 's/^ *//')
+
+# Nothing to do if there are no editors and the CLI did not install
 if [ -z "$INSTALLED_EDITORS" ]; then
     log_info "No supported editors (Cursor, VS Code, Windsurf) are installed. Skipping Corridor extension installation."
-    exit 0
+    if [ -z "$PROVISION_PLATFORMS" ]; then
+        exit 0
+    fi
 fi
 
 # Install Corridor extension for each installed editor
@@ -299,17 +316,15 @@ for editor in $INSTALLED_EDITORS; do
     fi
 done
 
-# Provision user and create separate API tokens for each installed editor
-CORRIDOR_CONFIG_DIR="/Users/$CURRENT_USER/.corridor"
-
+# Provision user and create a separate API token for each platform (each
+# installed editor plus the Corridor CLI)
 log_info "Provisioning user with Corridor..."
 
-for editor in $INSTALLED_EDITORS; do
-    PLATFORM=$(get_editor_platform "$editor")
-    EDITOR_CONFIG_DIR="$CORRIDOR_CONFIG_DIR/$PLATFORM"
-    CORRIDOR_PENDING_TOKEN_FILE="$EDITOR_CONFIG_DIR/pending-token"
+for PLATFORM in $PROVISION_PLATFORMS; do
+    PLATFORM_CONFIG_DIR="$CORRIDOR_CONFIG_DIR/$PLATFORM"
+    CORRIDOR_PENDING_TOKEN_FILE="$PLATFORM_CONFIG_DIR/pending-token"
 
-    log_info "Creating API token for $editor ($PLATFORM)..."
+    log_info "Creating API token for $PLATFORM..."
 
     RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
         -H "Authorization: Bearer $CORRIDOR_TEAM_TOKEN" \
@@ -320,7 +335,7 @@ for editor in $INSTALLED_EDITORS; do
     CURL_EXIT_CODE=$?
 
     if [ $CURL_EXIT_CODE -ne 0 ]; then
-        log_error "Failed to connect to Corridor API for $editor (curl exit code: $CURL_EXIT_CODE)"
+        log_error "Failed to connect to Corridor API for $PLATFORM (curl exit code: $CURL_EXIT_CODE)"
         log_error "Response: $RESPONSE"
         exit 1
     fi
@@ -329,7 +344,7 @@ for editor in $INSTALLED_EDITORS; do
     BODY=$(echo "$RESPONSE" | sed '$d')
 
     if [ -z "$HTTP_CODE" ] || [ "$HTTP_CODE" != "200" ]; then
-        log_error "Failed to provision user for $editor. HTTP $HTTP_CODE"
+        log_error "Failed to provision token for $PLATFORM. HTTP $HTTP_CODE"
         log_error "Response body: $BODY"
         exit 1
     fi
@@ -339,18 +354,18 @@ for editor in $INSTALLED_EDITORS; do
     API_TOKEN_ID=$(echo "$BODY" | grep -o '"apiTokenId":"[^"]*"' | cut -d'"' -f4)
 
     if [ -z "$API_TOKEN" ]; then
-        log_error "Could not extract API token from response for $editor"
+        log_error "Could not extract API token from response for $PLATFORM"
         exit 1
     fi
 
-    # Create editor-specific config directory and write pending token file.
+    # Create platform-specific config directory and write pending token file.
     # Use umask 077 in a subshell so the directory is born 700 and the file is
     # born 600, ensuring the API token is never world-readable on disk.
     (
         umask 077
 
-        # Create editor-specific config directory with proper permissions
-        mkdir -p "$EDITOR_CONFIG_DIR"
+        # Create platform-specific config directory with proper permissions
+        mkdir -p "$PLATFORM_CONFIG_DIR"
 
         # Write pending token file
         cat > "$CORRIDOR_PENDING_TOKEN_FILE" << EOF
@@ -362,10 +377,10 @@ for editor in $INSTALLED_EDITORS; do
 EOF
     )
 
-    chmod 700 "$EDITOR_CONFIG_DIR"
+    chmod 700 "$PLATFORM_CONFIG_DIR"
     chmod 600 "$CORRIDOR_PENDING_TOKEN_FILE"
     chown -R "$CURRENT_USER" "$CORRIDOR_CONFIG_DIR"
-    log_info "Pending token for $editor stored in $CORRIDOR_PENDING_TOKEN_FILE"
+    log_info "Pending token for $PLATFORM stored in $CORRIDOR_PENDING_TOKEN_FILE"
 done
 
 log_success "User provisioned successfully!"
