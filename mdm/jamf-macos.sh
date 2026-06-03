@@ -107,14 +107,15 @@ log_info "Current User: $CURRENT_USER"
 # Download and install the Corridor CLI for the logged-in user. The installer
 # places the binary under the user's ~/.corridor/bin and symlinks it into
 # ~/.local/bin, so it must run as the interactive user (not root) for HOME to
-# resolve correctly. Setting CI=1 skips the interactive Claude Code plugin
-# setup, which cannot run unattended in an MDM context.
+# resolve correctly. CI=1 skips the interactive Claude Code plugin setup, which
+# cannot run unattended in an MDM context. CORRIDOR_MDM=1 tells the installer
+# this is a persistent managed device so it still updates the shell profile.
 log_info "Installing the Corridor CLI for $CURRENT_USER..."
 
 CORRIDOR_CONFIG_DIR="/Users/$CURRENT_USER/.corridor"
 CLI_INSTALLED="false"
 
-if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" CI=1 \
+if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" CI=1 CORRIDOR_MDM=1 \
     bash -c 'set -o pipefail; curl -fsSL https://app.corridor.dev/cli/install.sh | bash'; then
     log_success "Corridor CLI installed successfully"
     CLI_INSTALLED="true"
