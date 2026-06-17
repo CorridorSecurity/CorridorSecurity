@@ -329,5 +329,25 @@ done
 log_success "User provisioned successfully!"
 log_info "The Corridor extension will migrate tokens to secure storage on next launch of that editor"
 
+# ============================================================================
+# Install agent plugins (Claude Code, Factory Droid, Codex)
+# ============================================================================
+# With the CLI installed and the device's "cli" token provisioned above,
+# configure the agent plugins for the user. `corridor install` migrates the
+# pending CLI token into ~/.corridor/config.env at startup and authenticates
+# from it non-interactively (--yes auto-confirms all interactive prompts). It detects which agent CLIs
+# are present in PATH (claude, droid, codex); a missing agent CLI is a non-fatal
+# no-op so it never blocks the managed rollout.
+if [ "$CLI_INSTALLED" = "true" ]; then
+    log_info "Setting up Corridor agent plugins (Claude Code, etc.) for $CURRENT_USER..."
+    if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" \
+        PATH="/Users/$CURRENT_USER/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+        "/Users/$CURRENT_USER/.corridor/bin/corridor" install --yes; then
+        log_success "Corridor agent plugins installed"
+    else
+        log_info "Corridor agent plugin setup skipped or incomplete (non-fatal — e.g. no claude/droid/codex in PATH, or install did not finish). See corridor output above for the cause."
+    fi
+fi
+
 log_success "Corridor MDM provisioning complete!"
 exit 0
