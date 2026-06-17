@@ -1,0 +1,23 @@
+mdm/kandji-macos.sh
+  s_1873681133fc6d::t_e9202be3670ab2 334
+mdm/jamf-macos.sh
+  s_1873681133fc6d::t_a36b6a4658d56e 348
+mdm/intune-macos.sh
+  s_1873681133fc6d::t_3c2c97a2492cec 406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "14fde9bd90a81ca87306edc666d88efabeb0c223",
+  "prompts": {},
+  "sessions": {
+    "s_1873681133fc6d": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "2353ca66-a725-418b-8ac7-0f4644c5a578",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Camden Moore <camden@corridor.dev>"
+    }
+  }
+}
