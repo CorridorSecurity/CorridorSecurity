@@ -345,7 +345,7 @@ if [ "$CLI_INSTALLED" = "true" ]; then
         "/Users/$CURRENT_USER/.corridor/bin/corridor" install --yes; then
         log_success "Corridor agent plugins installed"
     else
-        log_info "No supported agent CLI (claude, droid, codex) detected, or plugin setup incomplete — skipping"
+        log_info "Corridor agent plugin setup skipped or incomplete (non-fatal — e.g. no claude/droid/codex in PATH, or install did not finish). See corridor output above for the cause."
     fi
 fi
 
