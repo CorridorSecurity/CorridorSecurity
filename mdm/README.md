@@ -11,7 +11,9 @@ These scripts automate the deployment of the Corridor extension to developer mac
 2. **Install the Corridor extension** - Use each editor's CLI to install the extension
 3. **Provision API tokens** - Create per-editor API tokens for the user and store them for the extension to pick up on next launch
 
-On macOS, the scripts also download and install the [Corridor CLI](https://app.corridor.dev/cli/install.sh) for the logged-in user (via `curl -fsSL https://app.corridor.dev/cli/install.sh | bash`).
+The scripts also download and install the Corridor CLI for the logged-in user, provision a `cli` API token, and run `corridor install --yes` to set up agent plugins (Claude Code, Factory Droid, Codex). On macOS this uses [install.sh](https://app.corridor.dev/cli/install.sh) (`curl -fsSL https://app.corridor.dev/cli/install.sh | bash`); on Windows it uses [install.ps1](https://app.corridor.dev/cli/install.ps1).
+
+> **Windows execution context:** macOS scripts run as root and use `sudo -u "$CURRENT_USER"` to do per-user work as the signed-in user. Windows has no unprivileged equivalent — a SYSTEM-context script cannot drop to the user without their password — so `intune-windows.ps1` must be deployed with Intune's **"Run this script using the logged-on credentials = Yes"** setting so it runs in the signed-in user's context.
 
 ## Available Scripts
 
