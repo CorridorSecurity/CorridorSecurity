@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  powershell-parse:
+    name: PowerShell parse check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse-check PowerShell MDM scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = Get-ChildItem -Path mdm -Filter *.ps1 -Recurse -File
+          if (-not $files) {
+            Write-Host 'No PowerShell scripts found under mdm/.'
+            exit 0
+          }
+
+          $failed = $false
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              $failed = $true
+              foreach ($err in $errors) {
+                Write-Host "::error file=$($file.FullName),line=$($err.Extent.StartLineNumber)::$($err.Message)"
+              }
+            } else {
+              Write-Host "OK: $($file.FullName)"
+            }
+          }
+
+          if ($failed) { exit 1 }
