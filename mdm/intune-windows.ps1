@@ -186,36 +186,48 @@ function Get-UserEmailFromGraph {
     #>
     param([string]$DeviceSerial)
 
-    try {
-        Write-Log "Querying Microsoft Graph API for device serial: $DeviceSerial"
+    # WMI reports some serials (e.g. Parallels VMs) with embedded spaces, but Intune
+    # stores the serial with whitespace stripped. Try the raw serial first, then the
+    # whitespace-stripped variant so the OData `eq` filter matches either form.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add($DeviceSerial)
+    $stripped = ($DeviceSerial -replace '\s', '')
+    if ($stripped -ne $DeviceSerial) {
+        $candidates.Add($stripped)
+    }
 
-        $filter = [uri]::EscapeDataString("serialNumber eq '$DeviceSerial'")
-        $select = [uri]::EscapeDataString("id,deviceName,serialNumber,userPrincipalName")
-        # The leading `$ in `$filter/`$select are literal OData parameter names,
-        # not PowerShell variables, so they are backtick-escaped.
-        $graphUrl = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=$filter&`$select=$select"
+    $headers = @{
+        "Authorization" = "Bearer $GRAPH_API_TOKEN"
+        "Content-Type"  = "application/json"
+    }
 
-        $headers = @{
-            "Authorization" = "Bearer $GRAPH_API_TOKEN"
-            "Content-Type"  = "application/json"
-        }
+    foreach ($candidate in $candidates) {
+        try {
+            Write-Log "Querying Microsoft Graph API for device serial: $candidate"
 
-        $response = Invoke-RestMethod -Uri $graphUrl -Method Get -Headers $headers -UseBasicParsing -ErrorAction Stop
+            $filter = [uri]::EscapeDataString("serialNumber eq '$candidate'")
+            $select = [uri]::EscapeDataString("id,deviceName,serialNumber,userPrincipalName")
+            # The leading `$ in `$filter/`$select are literal OData parameter names,
+            # not PowerShell variables, so they are backtick-escaped.
+            $graphUrl = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=$filter&`$select=$select"
 
-        if ($response.value -and $response.value.Count -gt 0) {
-            $email = $response.value[0].userPrincipalName
-            if ($email) {
-                return $email
+            $response = Invoke-RestMethod -Uri $graphUrl -Method Get -Headers $headers -UseBasicParsing -ErrorAction Stop
+
+            if ($response.value -and $response.value.Count -gt 0) {
+                $email = $response.value[0].userPrincipalName
+                if ($email) {
+                    return $email
+                }
             }
-        }
 
-        Write-Log "No device found in Graph API response for serial: $DeviceSerial" -Level ERROR
-        return $null
+            Write-Log "No device found in Graph API response for serial: $candidate" -Level ERROR
+        }
+        catch {
+            Write-Log "Failed to get user email from Graph API: $($_.Exception.GetType().Name) - $_" -Level ERROR
+        }
     }
-    catch {
-        Write-Log "Failed to get user email from Graph API: $($_.Exception.GetType().Name) - $_" -Level ERROR
-        return $null
-    }
+
+    return $null
 }
 
 function Get-LoggedInUser {
