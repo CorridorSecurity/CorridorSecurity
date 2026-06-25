@@ -1,0 +1,19 @@
+mdm/intune-windows.ps1
+  s_a3ce64fe192b33::t_13ef8512062567 189-197,199-202,204-206,208-212,214-220,223-227,229-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "e74717c0da2c7e3264474c2d00ea6308c2248a9f",
+  "prompts": {},
+  "sessions": {
+    "s_a3ce64fe192b33": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "0846aa50-b244-4f09-9106-86b04c021b1f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Camden Moore <camden@corridor.dev>"
+    }
+  }
+}
