@@ -635,5 +635,144 @@ if ($CliInstalled) {
     }
 }
 
+# ============================================================================
+# Provision Corridor inside WSL distros (optional; skipped if WSL absent)
+# ============================================================================
+# Developers often run their coding agents (claude/codex/droid) *inside* a WSL
+# distro, whose Linux $HOME is separate from %USERPROFILE% -- so none of the
+# Windows provisioning above reaches it. For each installed distro we replicate
+# the Linux flow: install the Linux Corridor CLI, provision a "cli" token, write
+# the pending-token, and run `corridor install --yes`. Per-distro failures are
+# non-fatal (logged, loop continues), matching the macOS CLI step.
+$wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+if ($wsl) {
+    # wsl -l -q emits UTF-16LE; decode and drop blank/docker-desktop entries.
+    $rawDistros = & wsl.exe --list --quiet 2>$null
+    $distros = ($rawDistros -split "`r?`n") |
+        ForEach-Object { ($_ -replace "`0", "").Trim() } |
+        Where-Object { $_ -and $_ -notmatch '^docker-desktop' }
+
+    if (-not $distros) {
+        Write-Log "WSL is installed but no provisionable distros found; skipping WSL provisioning."
+    }
+
+    # Single-quoted here-string: PowerShell does NOT interpolate, so $HOME / $COR_*
+    # are evaluated by bash inside the distro. Secrets arrive via WSLENV (below),
+    # never interpolated into this string or the wsl.exe argument list.
+    $wslScript = @'
+set -eu
+
+# Fail loudly if the forwarded inputs did not cross the WSL boundary (an empty
+# Bearer token otherwise surfaces as a cryptic 403 from mdm-sync-device).
+[ -n "${COR_TOKEN:-}" ]  || { echo "COR_TOKEN not forwarded into WSL (check WSLENV)"; exit 3; }
+[ -n "${COR_EMAIL:-}" ]  || { echo "COR_EMAIL not forwarded into WSL"; exit 3; }
+[ -n "${COR_SERIAL:-}" ] || { echo "COR_SERIAL not forwarded into WSL"; exit 3; }
+[ -n "${COR_API:-}" ]    || { echo "COR_API not forwarded into WSL"; exit 3; }
+
+# Agent CLIs (claude/codex/droid) and corridor live in ~/.local/bin. This shell is
+# non-login/non-interactive, so it never sourced ~/.bashrc -- put the dir on PATH
+# explicitly so `corridor install` can detect the installed agents.
+export PATH="$HOME/.local/bin:$PATH"
+
+# Best-effort prereqs (minimal images may lack curl/CA certs); ignore if no apt/root.
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || true
+fi
+
+# 1. Install the Linux Corridor CLI (auto-detects arm64/amd64). CI=1 keeps it
+#    non-interactive; CORRIDOR_MDM=1 updates ~/.bashrc and defers plugin setup.
+curl -fsSL https://app.corridor.dev/cli/install.sh | CI=1 CORRIDOR_MDM=1 bash
+CORRIDOR_BIN="$HOME/.corridor/bin/corridor"
+[ -x "$CORRIDOR_BIN" ] || { echo "Corridor CLI missing after install at $CORRIDOR_BIN"; exit 4; }
+
+# 2. Provision a CLI token. Capture status + body so a non-200 fails loudly
+#    (a non-200 body is an error message and never contains a token).
+mkdir -p "$HOME/.corridor/cli"; chmod 700 "$HOME/.corridor" "$HOME/.corridor/cli"
+umask 077
+resp_file="$(mktemp)"
+trap 'rm -f "$resp_file"' EXIT
+body=$(printf '{"deviceSerial":"%s","userEmail":"%s","platform":"cli"}' "$COR_SERIAL" "$COR_EMAIL")
+http=$(curl -sS -o "$resp_file" -w '%{http_code}' -X POST \
+    "$COR_API/extension-auth/mdm-sync-device" \
+    -H "Authorization: Bearer $COR_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary "$body")
+if [ "$http" != "200" ]; then
+    echo "mdm-sync-device failed: HTTP $http $(cat "$resp_file" 2>/dev/null)"
+    exit 5
+fi
+
+# 3. Write the pending-token. Read the response file BY PATH (argv), not stdin, so
+#    there is no clash with how this script itself is fed to bash. python3 preferred;
+#    grep fallback validates the cor_ prefix. chmod 600 == the icacls grant on Windows.
+pending="$HOME/.corridor/cli/pending-token"
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, sys, datetime
+resp = json.load(open(sys.argv[1]))
+token = resp["apiToken"]
+assert token.startswith("cor_"), "unexpected token format"
+out = {"apiToken": token, "apiTokenId": resp.get("apiTokenId"),
+       "provisionedAt": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+open(sys.argv[2], "w").write(json.dumps(out))
+' "$resp_file" "$pending"
+else
+    token=$(grep -oE '"apiToken"[[:space:]]*:[[:space:]]*"cor_[^"]+"' "$resp_file" | sed -E 's/.*"(cor_[^"]+)"/\1/')
+    [ -n "$token" ] || { echo "Could not extract apiToken from response"; exit 6; }
+    printf '{"apiToken":"%s","provisionedAt":"%s"}' "$token" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$pending"
+fi
+chmod 600 "$pending"
+
+# 4. Migrate the token + set up agent plugins (claude/codex/droid if in PATH). Non-fatal.
+"$CORRIDOR_BIN" install --yes || echo "corridor install incomplete (non-fatal)"
+echo "Corridor WSL provisioning complete for $(whoami)"
+'@
+
+    # Normalize CRLF->LF (bash chokes on \r) and base64-encode so the script crosses
+    # the PowerShell -> wsl.exe -> bash boundary without quote/paren mangling. Base64
+    # uses only [A-Za-z0-9+/=], so native-arg quoting cannot corrupt it.
+    $wslScriptLf  = $wslScript -replace "`r`n", "`n"
+    $wslScriptB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($wslScriptLf))
+
+    foreach ($distro in $distros) {
+        Write-Log "Provisioning Corridor inside WSL distro: $distro"
+
+        # Forward secrets/inputs via WSLENV (NOT interpolated into the command line),
+        # so the team token never appears in process args inside the distro.
+        $env:COR_TOKEN = $CORRIDOR_TEAM_TOKEN
+        $env:COR_SERIAL = $DeviceSerial
+        $env:COR_EMAIL = $UserEmail
+        $env:COR_API = $CORRIDOR_API_URL
+        $env:WSLENV = "COR_TOKEN/u:COR_SERIAL/u:COR_EMAIL/u:COR_API/u"
+        try {
+            # Run via Invoke-NativeCommand (array args, relaxed ErrorActionPreference)
+            # so stderr from inside the distro cannot raise a terminating
+            # NativeCommandError. The script is delivered base64-encoded and decoded
+            # inside the distro to avoid quote mangling across the boundary.
+            $wslResult = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @(
+                "-d", $distro, "--", "bash", "-lc", "echo $wslScriptB64 | base64 -d | bash"
+            )
+            if ($wslResult.Output) {
+                foreach ($line in ($wslResult.Output -split "`r?`n")) {
+                    if ($line.Trim()) { Write-Log "[$distro] $line" }
+                }
+            }
+            if ($wslResult.ExitCode -eq 0) {
+                Write-Log "Corridor provisioned in WSL distro '$distro'" -Level SUCCESS
+            }
+            else {
+                Write-Log "WSL provisioning for '$distro' exited $($wslResult.ExitCode) (non-fatal)" -Level ERROR
+            }
+        }
+        finally {
+            Remove-Item Env:\COR_TOKEN, Env:\COR_SERIAL, Env:\COR_EMAIL, Env:\COR_API, Env:\WSLENV -ErrorAction SilentlyContinue
+        }
+    }
+}
+else {
+    Write-Log "WSL not present; skipping WSL provisioning."
+}
+
 Write-Log "Corridor MDM provisioning complete!" -Level SUCCESS
 exit 0
