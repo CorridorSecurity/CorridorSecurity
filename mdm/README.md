@@ -64,7 +64,7 @@ For MacOS devices managed by **Fleet** ([fleetdm.com](https://fleetdm.com)), run
 
 **Requirements:**
 - `CORRIDOR_TEAM_TOKEN` - Your team's Universal Team Token from Corridor settings, stored as a Fleet custom variable named `CORRIDOR_TEAM_TOKEN` (the script references it as `$FLEET_SECRET_CORRIDOR_TEAM_TOKEN`, which Fleet substitutes server-side and masks in its UI and API)
-- `fleet-dev.corridor.mdm.mobileconfig` (in this directory) uploaded as a Fleet custom configuration profile. It pushes the user's email and device serial to `/Library/Managed Preferences/dev.corridor.mdm.plist` using Fleet's built-in variables (`$FLEET_VAR_HOST_END_USER_IDP_USERNAME` and `$FLEET_VAR_HOST_HARDWARE_SERIAL`)
+- `fleet-dev.corridor.mdm.mobileconfig` (in this directory) uploaded under **Controls → OS settings → Configuration profiles** (called "Custom settings" before Fleet 4.84), scoped to the fleet containing your target hosts. It pushes the user's email and device serial to `/Library/Managed Preferences/dev.corridor.mdm.plist` using Fleet's built-in variables (`$FLEET_VAR_HOST_END_USER_IDP_USERNAME` and `$FLEET_VAR_HOST_HARDWARE_SERIAL`)
 - Fleet must know each host's end user (IdP integration or human-to-host mapping), and the resolved IdP username must be an email address, otherwise the profile fails to resolve the email variable
 - Script execution enabled in `fleetd` (enabled by default on hosts with Fleet MDM turned on)
 - An active console session on the Mac. Because Fleet policy automations run unattended, the script skips (exit 0) rather than provisioning to the wrong home directory when nobody is signed in, and the automation picks it up on a later run

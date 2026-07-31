@@ -34,14 +34,18 @@
 #
 # Fleet Setup:
 #   1. Get a Universal Team Token from your Corridor team settings
-#   2. In Fleet, create a custom variable named CORRIDOR_TEAM_TOKEN
-#      (referenced as $FLEET_SECRET_CORRIDOR_TEAM_TOKEN) with your token
-#      as the value
+#   2. In Fleet, under Controls > Variables, create a custom variable named
+#      CORRIDOR_TEAM_TOKEN (referenced as $FLEET_SECRET_CORRIDOR_TEAM_TOKEN)
+#      with your token as the value
 #   3. Upload fleet-dev.corridor.mdm.mobileconfig under
-#      Controls > OS settings > Custom settings (scoped to your target team)
+#      Controls > OS settings > Configuration profiles, scoped to the fleet
+#      containing your target hosts
 #   4. Upload this script under Controls > Scripts
 #   5. Run it on hosts manually (Hosts > select host > Actions > Run Script),
 #      via the API/fleetctl, or automatically through a policy automation
+#
+#   UI labels above are Fleet 4.84+. Older versions call Configuration
+#   profiles "Custom settings", and fleets "teams".
 #
 #   Note: Fleet runs shell scripts as root, so per-user work below is done
 #   as the logged-in user via sudo -u. Script execution must be enabled in
