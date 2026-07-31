@@ -22,7 +22,7 @@
         </dict>
     </array>
     <key>PayloadDescription</key>
-    <string>Pushes the device's user email and serial number to /Library/Managed Preferences/dev.corridor.mdm.plist for the Corridor MDM provisioning script (fleet-macos.sh). Fleet substitutes the $FLEET_VAR_* variables per host before delivery.</string>
+    <string>Provides device identity for Corridor MDM provisioning.</string>
     <key>PayloadDisplayName</key>
     <string>Corridor MDM Device Info</string>
     <key>PayloadIdentifier</key>
