@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadDisplayName</key>
+            <string>Corridor MDM Device Info</string>
+            <key>PayloadIdentifier</key>
+            <string>dev.corridor.mdm.67BBAA85-E8EB-4F54-A42B-D996DBB28F0E</string>
+            <key>PayloadType</key>
+            <string>dev.corridor.mdm</string>
+            <key>PayloadUUID</key>
+            <string>67BBAA85-E8EB-4F54-A42B-D996DBB28F0E</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>UserEmail</key>
+            <string>$FLEET_VAR_HOST_END_USER_IDP_USERNAME</string>
+            <key>SerialNumber</key>
+            <string>$FLEET_VAR_HOST_HARDWARE_SERIAL</string>
+        </dict>
+    </array>
+    <key>PayloadDescription</key>
+    <string>Pushes the device's user email and serial number to /Library/Managed Preferences/dev.corridor.mdm.plist for the Corridor MDM provisioning script (fleet-macos.sh). Fleet substitutes the $FLEET_VAR_* variables per host before delivery.</string>
+    <key>PayloadDisplayName</key>
+    <string>Corridor MDM Device Info</string>
+    <key>PayloadIdentifier</key>
+    <string>dev.corridor.mdm</string>
+    <key>PayloadScope</key>
+    <string>System</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>1209ABFD-126D-4B70-B9D7-1C8B8F531426</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
