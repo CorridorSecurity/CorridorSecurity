@@ -65,7 +65,9 @@ For MacOS devices managed by **Fleet** ([fleetdm.com](https://fleetdm.com)), run
 **Requirements:**
 - `CORRIDOR_TEAM_TOKEN` - Your team's Universal Team Token from Corridor settings, stored as a Fleet custom variable named `CORRIDOR_TEAM_TOKEN` (the script references it as `$FLEET_SECRET_CORRIDOR_TEAM_TOKEN`, which Fleet substitutes server-side and masks in its UI and API)
 - `fleet-dev.corridor.mdm.mobileconfig` (in this directory) uploaded as a Fleet custom configuration profile. It pushes the user's email and device serial to `/Library/Managed Preferences/dev.corridor.mdm.plist` using Fleet's built-in variables (`$FLEET_VAR_HOST_END_USER_IDP_USERNAME` and `$FLEET_VAR_HOST_HARDWARE_SERIAL`)
-- Fleet must know each host's end user (IdP integration or human-to-host mapping), otherwise the profile fails to resolve the email variable
+- Fleet must know each host's end user (IdP integration or human-to-host mapping), and the resolved IdP username must be an email address, otherwise the profile fails to resolve the email variable
 - Script execution enabled in `fleetd` (enabled by default on hosts with Fleet MDM turned on)
+- An active console session on the Mac. Because Fleet policy automations run unattended, the script skips (exit 0) rather than provisioning to the wrong home directory when nobody is signed in, and the automation picks it up on a later run
+- Optional: set `CORRIDOR_CLI_SHA256` in the script to pin the expected SHA-256 of the Corridor CLI installer. The script logs the observed hash when unset
 
-The script reads the user's email and device serial from the managed plist, mirroring the Jamf Pro flow.
+The script reads the user's email and device serial from the managed plist, mirroring the Jamf Pro flow. It is hardened beyond the other MDM scripts: the team token reaches `curl` through a config file on stdin instead of argv, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted, since Fleet stores script output verbatim.
