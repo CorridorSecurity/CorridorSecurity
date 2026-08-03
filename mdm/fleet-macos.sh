@@ -91,8 +91,9 @@ is_safe_username() {
 }
 
 # Fleet stores script output verbatim and does not redact secrets from it.
+# Team tokens use cor-…; minted API tokens use cor_… — both must be scrubbed.
 redact() {
-    printf '%s' "$1" | tr -d '\n' | cut -c1-200 | sed 's/cor-[A-Za-z0-9._-]*/[redacted]/g'
+    printf '%s' "$1" | tr -d '\n' | cut -c1-200 | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g'
 }
 
 # An undefined Fleet variable leaves the literal placeholder in place.
