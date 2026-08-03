@@ -1,7 +1,7 @@
 # Corridor MDM Provisioning Scripts
 
 These are scripts for deploying the Corridor extension to managed devices via MDM (Mobile Device Management) solutions. 
-For detailed instructions on how to run these on your MDM, refer to the [MDM Support Guide](https://app.usepylon.com/docs/4b84ff2b-3cc4-4452-a136-0297f288ebd4/articles/e3072a26-7a38-4822-8308-9de3677afae3).
+For detailed instructions on how to run these on your MDM, refer to the [MDM Support Guide](https://docs.corridor.dev/administration/mdm-support).
 
 ## What These Scripts Do
 

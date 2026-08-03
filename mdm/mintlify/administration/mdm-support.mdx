@@ -1,0 +1,673 @@
+---
+title: "MDM Support Guide"
+description: "Provision Corridor across your organization using Mobile Device Management tools."
+---
+
+# MDM Support Guide
+
+> Provision Corridor across your organization using Mobile Device Management tools.
+
+<Note>
+  MDM rollout is available on **Enterprise** plans only.
+</Note>
+
+If your enterprise uses an MDM (Mobile Device Management) tool, you can provision Corridor across all employees automatically. With MDM, developers don't need to separately install the Corridor extension or sign up—everything is handled for them.
+
+## Supported platforms
+
+| MDM          | OS Support     |
+| ------------ | -------------- |
+| Kandji / Iru | macOS          |
+| Intune       | macOS, Windows |
+| JAMF         | macOS          |
+| Fleet        | macOS          |
+
+### Supported IDEs/coding agents
+
+* VS Code
+* Devin Desktop
+* Cursor
+* Claude Code (via Corridor CLI)
+* Codex (via Corridor CLI)
+* Factory Droid (via Corridor CLI)
+
+## Prerequisites
+
+* **Enterprise tier subscription** to Corridor. You can verify this at [app.corridor.dev/teams](https://app.corridor.dev/teams)
+* **Team Owner role** in Corridor. You can verify this at [app.corridor.dev/teams](https://app.corridor.dev/teams)—you should see "Owner" next to your email
+
+## Verifying a domain
+
+In order to use the MDM scripts, you must verify an email domain for your team. Corridor will only provision users with the email domain you have verified.
+
+<Steps>
+  <Step title="Navigate to Teams">
+    Go to [app.corridor.dev/teams](https://app.corridor.dev/teams).
+  </Step>
+
+  <Step title="Enter your domain">
+    Go to the **Domain Verification** section and enter your organization's domain name (e.g., `acme.com`).
+  </Step>
+
+  <Step title="Add DNS record">
+    Copy the DNS TXT record provided and add it to your DNS provider.
+  </Step>
+</Steps>
+
+## Creating a universal team token
+
+In order to use the MDM scripts, you must create a universal team token to identify your team and verify your team admin access.
+
+<Steps>
+  <Step title="Navigate to Teams">
+    Go to [app.corridor.dev/teams](https://app.corridor.dev/teams).
+  </Step>
+
+  <Step title="Generate a token">
+    Under **Universal Team Tokens**, click **Generate New Tokens**. Add a token name and select an expiration date.
+  </Step>
+
+  <Step title="Copy the token">
+    Copy the universal team token—you'll use it in the MDM scripts below.
+  </Step>
+</Steps>
+
+## JAMF (macOS only)
+
+For JAMF, you must create a configuration profile to push the `User email` and `Device serial` fields to each managed computer.
+
+### Creating a configuration profile
+
+#### Prerequisites
+
+To set up a JAMF configuration profile, you must have:
+
+* A push certificate in JAMF Pro. [See instructions here](https://learn.jamf.com/r/en-US/jamf-pro-documentation-current/Push_Certificates#concept-6218).
+* The `Enable certificate-based authentication` and `Enable push notifications` settings configured in Jamf Pro. For more information, see [Security Settings](https://learn.jamf.com/en-US/bundle/jamf-pro-documentation-current/page/Security_Settings.html#ID-000185c4).
+
+To create the configuration profile:
+
+<Steps>
+  <Step title="Add configuration profile">
+    In JAMF, go to **Computers** -> **Configuration Profiles**. Click **New**.
+  </Step>
+
+  <Step title="Setup configuration profile">
+    Set a name like 'Push plist for Corridor' with level 'Computer Level' and Distribution Method 'Install automatically'.
+    Set 'Scope' to 'All computers', or just all the computers you want to have access to Corridor.
+  </Step>
+
+  <Step title="Upload plist">
+    Go back to 'Options', and search for 'Application & Custom Settings'. Click the arrow underneath, and click 'Upload'.
+    Click 'Add'. Set the preference domain to `dev.corridor.mdm` and set the file contents to
+
+    ```xml theme={null}
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>UserEmail</key>
+        <string>$EMAIL</string>
+        <key>SerialNumber</key>
+        <string>$SERIALNUMBER</string>
+    </dict>
+    </plist>
+    ```
+
+    Or download [dev.corridor.mdm.plist](https://github.com/CorridorSecurity/CorridorSecurity/blob/main/mdm/dev.corridor.mdm.plist)
+    and upload those contents.
+  </Step>
+
+  <Step title="Save configuration">
+    Save your configuration and check that it was pushed to your devices.
+  </Step>
+</Steps>
+
+### Add the Corridor script
+
+<Steps>
+  <Step title="Create a script">
+    In JAMF, go to **Settings** and search for **Scripts**. It should be under **Computer management**.
+  </Step>
+
+  <Step title="Download the script">
+    Download the Corridor JAMF script:
+
+    ```bash theme={null}
+    curl https://raw.githubusercontent.com/CorridorSecurity/CorridorSecurity/refs/heads/main/mdm/jamf-macos.sh -o jamf-macos.sh
+    ```
+  </Step>
+
+  <Step title="Add your token">
+    Replace the `CORRIDOR_TEAM_TOKEN` value at the top of the file with the universal team token you generated.
+  </Step>
+
+  <Step title="Upload and save">
+    Name the script something along the lines of `Corridor Installation Script`, and upload the script with the shell/bash language option.
+    Save the script.
+  </Step>
+</Steps>
+
+### Create a policy
+
+<Steps>
+  <Step title="Create a policy">
+    In JAMF, go to **Computers** and then **Policies**. It should be under **Content management**. Click 'New'.
+  </Step>
+
+  <Step title="Set the policy">
+    Set the policy name to be 'Corridor Installation Policy'. Select 'Recurring Check-in' as the trigger (unless otherwise desired), with the execution frequency as 'Once per computer'.
+    Click 'Automatically re-run policy on failure'. Set the scope as desired (All computers or specific computers).
+  </Step>
+
+  <Step title="Add the script to the policy">
+    In options, click **Scripts** and choose 'Configure Scripts'. Add the `Corridor Installation Script` you created in the previous step, and save the policy.
+  </Step>
+</Steps>
+
+Now, just wait for the scripts to run on the computers the policy is pushed out to. Once users restart their IDEs, they should be automatically signed in to Corridor and the extension installed.
+
+## Fleet (macOS only)
+
+For Fleet, you must deploy a configuration profile that pushes the `User email`
+and `Device serial` fields to each managed Mac, then run the Corridor script.
+Fleet can only substitute its per-host variables into configuration profiles,
+not into scripts, which is why both pieces are required.
+
+<Note>
+  Script support for built-in `$FLEET_VAR_*` variables is targeted for Fleet 4.91
+  ([fleetdm/fleet#46837](https://github.com/fleetdm/fleet/issues/46837)). When
+  that ships, the configuration profile can be dropped and the script can read
+  both values directly.
+</Note>
+
+### Prerequisites
+
+* Fleet Premium with MDM turned on for your macOS hosts. Script execution is
+  enabled automatically for MDM-enrolled hosts; otherwise deploy `fleetd` with
+  `--enable-scripts`. A host with `fleetd` installed but `MDM status: Off` can
+  neither receive configuration profiles nor, by default, run scripts, so
+  confirm MDM is on before troubleshooting anything else.
+* Fleet must know each host's end user, through your IdP integration or a
+  human-to-host mapping, and the resolved IdP username must be an email
+  address. The profile below cannot be delivered to a host with no known end
+  user.
+* A **Universal Team Token** from your Corridor team settings
+  (Settings > Team > Universal Team Token).
+* A user signed in at the console on the target Mac. The script deliberately
+  skips provisioning when nobody is signed in, so a credential is never written
+  into the wrong home directory.
+
+### Store your team token as a Fleet custom variable
+
+<Steps>
+  <Step title="Add the custom variable">
+    In Fleet, go to **Controls → Variables** and add a custom variable named
+    `CORRIDOR_TEAM_TOKEN`, with the universal team token you generated as the
+    value.
+  </Step>
+
+  <Step title="How the script references it">
+    The script references it as `$FLEET_SECRET_CORRIDOR_TEAM_TOKEN`. Fleet
+    substitutes the value when the script is sent to each host and masks it in the
+    Fleet UI and API, so — unlike the other MDMs in this guide — you do **not**
+    paste your token into the script itself.
+  </Step>
+</Steps>
+
+### Creating a configuration profile
+
+<Steps>
+  <Step title="Download the profile">
+    Download the Corridor Fleet configuration profile:
+
+    ```bash theme={null}
+    curl https://raw.githubusercontent.com/CorridorSecurity/CorridorSecurity/refs/heads/main/mdm/fleet-dev.corridor.mdm.mobileconfig -o fleet-dev.corridor.mdm.mobileconfig
+    ```
+  </Step>
+
+  <Step title="Upload and scope the profile">
+    In Fleet, go to **Controls → OS settings → Configuration profiles** (called
+    **Custom settings** before Fleet 4.84) and upload the profile, scoped to the
+    fleet (called a **team** before Fleet 4.82) that contains your target hosts.
+  </Step>
+
+  <Step title="Confirm delivery on a test Mac">
+    The profile writes each host's IdP email and hardware serial to
+    `/Library/Managed Preferences/dev.corridor.mdm.plist` using Fleet's built-in
+    variables (`$FLEET_VAR_HOST_END_USER_IDP_USERNAME` and
+    `$FLEET_VAR_HOST_HARDWARE_SERIAL`). Confirm delivery on a test Mac:
+
+    ```bash theme={null}
+    defaults read "/Library/Managed Preferences/dev.corridor.mdm.plist"
+    ```
+
+    You should see `UserEmail` and `SerialNumber`. If nothing is there, the
+    profile has not been delivered — uploading only queues it, and Fleet holds it
+    back when it cannot resolve the IdP variable. Check the host's details page
+    under **OS settings**: a failed profile reads "There is no IdP username for
+    this host. Fleet couldn't populate $FLEET_VAR_HOST_END_USER_IDP_USERNAME."
+  </Step>
+
+  <Step title="Resolve a missing IdP username">
+    To resolve it, add the host's **IdP username** (the user's email address) on
+    the host details page — Fleet supports setting this manually, so a full
+    IdP/SCIM integration is not required to get started, and Fleet resends the
+    profile automatically once the value exists.
+  </Step>
+</Steps>
+
+### Add the Corridor script
+
+<Steps>
+  <Step title="Download the script">
+    Download the Corridor Fleet script:
+
+    ```bash theme={null}
+    curl https://raw.githubusercontent.com/CorridorSecurity/CorridorSecurity/refs/heads/main/mdm/fleet-macos.sh -o fleet-macos.sh
+    ```
+  </Step>
+
+  <Step title="Optionally pin the CLI checksum">
+    Optionally set `CORRIDOR_CLI_SHA256` near the top of the script to pin the
+    expected SHA-256 of the Corridor CLI installer. When it is left empty the
+    script logs the hash it saw, so you can pin it on a later rollout.
+  </Step>
+
+  <Step title="Upload the script">
+    In Fleet, go to **Controls → Scripts** and upload the file. If Fleet rejects
+    the upload with an unknown-variable error, the custom variable from the first
+    step is missing or misnamed — it must be exactly `CORRIDOR_TEAM_TOKEN`.
+  </Step>
+</Steps>
+
+### Run the script
+
+<Steps>
+  <Step title="On demand">
+    Go to **Hosts**, select a host, then **Actions → Run script**.
+    From the CLI:
+
+    ```bash theme={null}
+    fleetctl run-script --script-path=fleet-macos.sh --host=<hostname>
+    ```
+  </Step>
+
+  <Step title="Automatically">
+    Attach the script to a policy automation so it runs as
+    hosts come into scope. A policy that checks whether Corridor is already
+    provisioned keeps the script from re-running where it is not needed.
+    {/* TODO: ship a reference policy query customers can paste in. */}
+  </Step>
+</Steps>
+
+Once users restart their IDEs, they are automatically signed in to Corridor and
+the extension is installed.
+
+### Verifying
+
+* Script output appears in the host's activity feed in Fleet. Look for
+  `[Corridor MDM] SUCCESS: Corridor MDM provisioning complete!`.
+* On the device, pending tokens are written to
+  `~/.corridor/<platform>/pending-token` for each detected editor (`cursor`,
+  `vscode`, `windsurf`) plus `cli` when the Corridor CLI installed, and move
+  into secure storage on the next launch of that editor.
+* The device appears under your Corridor team's MDM-synced devices.
+  {/* TODO: screenshot of the Corridor dashboard device view. */}
+* If the Mac was sitting at the login window, the run reports
+  `No user is signed in at the console` and finishes successfully without
+  provisioning. This is intentional; a policy automation runs it again once
+  someone signs in.
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+| --- | --- |
+| Nothing at `/Library/Managed Preferences/dev.corridor.mdm.plist` | The profile has not been delivered. Uploading only queues it. Check the host's OS settings status in Fleet; the most common cause is the failed-variable case below. Verify with `ls -la "/Library/Managed Preferences/"` rather than `defaults read`, which prints nothing for a domain that does not exist. |
+| Profile shows as failed in Fleet | The host has no IdP username, so `$FLEET_VAR_HOST_END_USER_IDP_USERNAME` cannot resolve. Add the IdP username on the host details page (no full IdP integration required) or connect your IdP; Fleet resends automatically once it resolves. |
+| No hosts in any OS settings bucket | The host is not in the scoped fleet, or has `fleetd` without MDM turned on. Configuration profiles require MDM enrollment. |
+| Profile upload rejected outright | Variables in profiles require Fleet Premium. |
+| `CORRIDOR_TEAM_TOKEN is not configured` | The custom variable is missing or misnamed in Fleet, so the placeholder was never substituted. |
+| `CORRIDOR_TEAM_TOKEN contains unexpected characters` | The value in Fleet has surrounding quotes or stray whitespace. Re-copy the token. |
+| `Could not retrieve user email` / `device serial` | The configuration profile has not reached that host yet, or is scoped to the wrong fleet. |
+| `is not an email address` | Your IdP username is not an email address. Corridor maps devices to users by email. |
+| `No user is signed in at the console` | Expected at the login window; the run will be retried. |
+| `does not match the MDM-assigned user` (warning) | The person signed in differs from the device's assigned user. Confirm the device assignment, since tokens are written to the signed-in user's home directory. |
+| `is not owned by root` | Something other than MDM wrote the managed preferences file, so the script refuses to trust the identity in it. |
+| Extension install fails behind a TLS-intercepting proxy | The script sets `NODE_USE_SYSTEM_CA=1`; ensure your proxy root CA is installed in the macOS System keychain. |
+
+### Reference: what the script does on the device
+
+This detail used to live in comments inside the script and belongs here instead,
+so the script stays readable and the behaviour is documented in one place.
+
+Fleet runs scripts as root. Everything user-facing is done as the signed-in
+console user via `sudo -u`, so nothing lands in root's home or with root
+ownership:
+
+* **Corridor CLI** is downloaded to a temporary file, optionally checksummed
+  against `CORRIDOR_CLI_SHA256`, then executed as the user with `CI=1` (skips
+  interactive plugin setup, which cannot run unattended) and `CORRIDOR_MDM=1`
+  (marks a persistent managed device, so the installer still updates the shell
+  profile). It installs to `~/.corridor/bin` and symlinks into `~/.local/bin`.
+* **Editors** are detected in `/Applications`, falling back to `~/Downloads`
+  (where VS Code is often left). The extension is installed through each
+  editor's own CLI with `NODE_USE_SYSTEM_CA=1`, which adds the macOS System
+  keychain to the editor's bundled CA list so installs succeed behind
+  TLS-intercepting proxies.
+* **Tokens** are requested one per platform: one for each detected editor, plus
+  `cli` when the CLI installed. Each is written to
+  `~/.corridor/<platform>/pending-token` (mode `600`, inside a `700` directory,
+  owned by the user). The extension migrates its token into secure storage on
+  next launch; `corridor install --yes` migrates the `cli` token into
+  `~/.corridor/config.env` and configures whichever agent CLIs are present
+  (Claude Code, Factory Droid, Codex). A missing agent CLI is a non-fatal no-op.
+
+Identity handling worth knowing when supporting a rollout:
+
+* The email and serial are read from the managed plist only when it is a
+  regular, root-owned file, and both values must match a conservative character
+  set before use.
+* The script provisions only for the current console user, with no fallback to
+  the last-seen GUI user, and exits successfully without provisioning when
+  nobody is signed in. Under a policy automation the next run picks it up.
+* The team token is never passed on a command line, and token-shaped strings are
+  redacted from output, because Fleet stores script output verbatim and does not
+  mask secrets in it.
+
+### Limitations
+
+* macOS only. Fleet runs Windows scripts as SYSTEM and cannot run them as the
+  signed-in user, which Corridor provisioning requires; use Intune's "run using
+  logged-on credentials" flow for Windows, or contact us.
+
+## Kandji / Iru (macOS only)
+
+For Kandji (including Iru, Kandji's new UI), you must deploy a custom profile that writes Kandji's global variables to each device before running the Corridor script.
+
+<Note>
+  Iru does not include classic Kandji's **Global Variables** feature, so global variables are never written to devices unless you deploy them with a Custom Profile. The steps below use Kandji's official Global Variables profile and work in both classic Kandji and Iru.
+</Note>
+
+### Create a custom profile
+
+<Steps>
+  <Step title="Download the official Global Variables profile">
+    Download the official [Global Variables.mobileconfig](https://github.com/kandji-inc/support/blob/main/Global%20Variables/Global%20Variables.mobileconfig) provided by Kandji. When the profile is pushed to a device, Kandji substitutes its built-in global variables (including `$EMAIL` and `$SERIAL_NUMBER`) and writes them to `/Library/Managed Preferences/io.kandji.globalvariables.plist` — the file the Corridor Kandji script reads at runtime.
+  </Step>
+
+  <Step title="Add custom profile">
+    In Kandji or Iru, go to **Library** and add a **Custom Profile**.
+  </Step>
+
+  <Step title="Upload the profile">
+    Upload the `Global Variables.mobileconfig` file to the Custom Profile and save it.
+  </Step>
+
+  <Step title="Attach to your Blueprint">
+    Assign the Custom Profile to the Blueprint(s) where you want to deploy Corridor — the same Blueprint(s) you assign the Corridor script to in the next section.
+  </Step>
+</Steps>
+
+<Note>
+  If you author your own profile instead of using Kandji's, the keys **must** be named exactly `EMAIL` and `SERIAL_NUMBER` — these are the names the Corridor Kandji script reads at runtime. If your variables use different keys, you will have to change the `DEVICE_SERIAL` and `USER_EMAIL` variables in the script (the `PlistBuddy` print statements) to match.
+</Note>
+
+### Add the Corridor script
+
+<Steps>
+  <Step title="Create a custom script">
+    In Kandji or Iru, go to **Library** and add a **Custom Script**. Assign it to the same Blueprint(s) as the Custom Profile above. Select **Execution Frequency: Run once per device**.
+  </Step>
+
+  <Step title="Download the script">
+    Download the Corridor Kandji script:
+
+    ```bash theme={null}
+    curl https://raw.githubusercontent.com/CorridorSecurity/CorridorSecurity/refs/heads/main/mdm/kandji-macos.sh -o kandji-macos.sh
+    ```
+  </Step>
+
+  <Step title="Add your token">
+    Replace the `CORRIDOR_TEAM_TOKEN` value at the top of the file with the universal team token you generated.
+  </Step>
+
+  <Step title="Upload and save">
+    Upload the file with the correct `CORRIDOR_TEAM_TOKEN` to Kandji and click **Save**.
+  </Step>
+</Steps>
+
+## Intune
+
+Intune scripts support both macOS and Windows. You must first generate a Microsoft Graph token with the right permissions—this token is used to retrieve the device email.
+
+### Generate a Microsoft Graph token
+
+<Steps>
+  <Step title="Open Graph Explorer">
+    Go to [Microsoft Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer) and sign in.
+  </Step>
+
+  <Step title="Set permissions">
+    Click **Modify Permissions** and consent to `User.Read` permissions. This requires Admin consent.
+  </Step>
+
+  <Step title="Copy the token">
+    Refresh the page, then click **Access token** and copy the Microsoft Graph API access token.
+  </Step>
+</Steps>
+
+### Windows
+
+<Steps>
+  <Step title="Navigate to scripts">
+    On [intune.microsoft.com](https://intune.microsoft.com), go to **Devices → Scripts and remediations** under Manage Devices.
+  </Step>
+
+  <Step title="Add a script">
+    Click **Platform scripts → Add → Windows 10 and Later**. Set a name and description.
+  </Step>
+
+  <Step title="Download the script">
+    Download the Corridor Intune Windows script:
+
+    ```bash theme={null}
+    curl https://raw.githubusercontent.com/CorridorSecurity/CorridorSecurity/refs/heads/main/mdm/intune-windows.ps1 -o intune-windows.ps1
+    ```
+  </Step>
+
+  <Step title="Add your tokens">
+    In the script, replace the `CORRIDOR_TEAM_TOKEN` value with your universal token, and replace the `GRAPH_API_TOKEN` value with the Microsoft Graph API access token.
+  </Step>
+
+  <Step title="Configure script settings">
+    Select **Yes** for "Run this script using the logged on credentials", **No** for "Enforce script signature check", and **No** for "Run script in 64 bit Powershell Host".
+  </Step>
+
+  <Step title="Assign and save">
+    Assign the script to the selected group of devices and click **Save**. Sync all devices with bulk device actions to force the script to run.
+  </Step>
+</Steps>
+
+### macOS
+
+<Steps>
+  <Step title="Navigate to scripts">
+    On [intune.microsoft.com](https://intune.microsoft.com), go to **Devices → Scripts and remediations** under Manage Devices.
+  </Step>
+
+  <Step title="Add a script">
+    Click **Platform scripts → Add → macOS**. Add a name and description.
+  </Step>
+
+  <Step title="Download the script">
+    Download the Corridor Intune macOS script:
+
+    ```bash theme={null}
+    curl https://raw.githubusercontent.com/CorridorSecurity/CorridorSecurity/refs/heads/main/mdm/intune-macos.sh -o intune-macos.sh
+    ```
+  </Step>
+
+  <Step title="Add your tokens">
+    In the script, replace the `CORRIDOR_TEAM_TOKEN` value with your universal token, and replace the `GRAPH_API_TOKEN` value with the Microsoft Graph API access token.
+  </Step>
+
+  <Step title="Configure script settings">
+    Select **Yes** for "Run script as signed-in user" and **1 time** for "Max number of times to retry if script fails".
+  </Step>
+
+  <Step title="Assign and save">
+    Assign the correct groups to the script and click **Save**. Sync all devices with bulk device actions to force the script to run.
+  </Step>
+</Steps>
+
+## Rolling back a deployment
+
+You don't need a custom teardown script — the Corridor CLI ships an uninstaller that reverses everything the rollout does. Rolling back has two independent halves, and you'll usually want both:
+
+1. **Stop provisioning** so no device gets (re)installed.
+2. **Remove Corridor** from devices that were already provisioned.
+
+### 1. Stop provisioning
+
+* **Unscope or delete the Corridor install policy** (and, for JAMF, the `dev.corridor.mdm` configuration profile) in your MDM, so devices stop receiving the install.
+* **(Optional, org-wide kill switch) Revoke the Universal Team Token.** Go to [app.corridor.dev/teams](https://app.corridor.dev/teams) → **Universal Team Tokens** and revoke the token used in your MDM scripts. Once revoked, any `/mdm-sync-device` call fails, so no new users or device tokens are created. Devices already provisioned keep their per-user token until you run the uninstall below.
+
+### 2. Remove Corridor from a device
+
+Run the uninstaller **as the logged-in user**. It revokes that device's Corridor API token on the server and removes the CLI, agent hooks, MCP config, agent rules, and the `~/.corridor/` directory:
+
+```bash theme={null}
+curl -fsSL https://app.corridor.dev/cli/uninstall.sh | bash
+```
+
+Or, if the CLI binary is still present, call it directly:
+
+```bash theme={null}
+~/.corridor/bin/corridor uninstall --non-interactive
+```
+
+<Note>
+  The uninstaller removes Corridor's hooks, MCP config, agent rules, and credentials, but leaves the Corridor **IDE extension** itself installed (it's inert once the token is revoked). To also remove the extension binary, uninstall it per IDE — e.g. `code --uninstall-extension corridor.Corridor` and `cursor --uninstall-extension corridor.Corridor`. The JAMF script below does this for you.
+</Note>
+
+Push the uninstall through your MDM the same way you pushed the install.
+
+#### JAMF (macOS only)
+
+<Steps>
+  <Step title="Add an uninstall script">
+    In JAMF, go to **Settings → Scripts** and create a new script (shell/bash) named something like `Corridor Uninstall Script`, with these contents:
+
+    ```bash theme={null}
+    #!/bin/bash
+    # Corridor JAMF uninstaller (macOS) — reverses jamf-macos.sh.
+    # Scope this to a policy on the devices you want to roll back.
+    set -u
+
+    # Act on the logged-in user's home, not root's.
+    CONSOLE_USER=$(/usr/bin/stat -f%Su /dev/console)
+    if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+        echo "No console user logged in; will retry on next check-in."
+        exit 0
+    fi
+    USER_HOME=$(/usr/bin/dscl . -read "/Users/${CONSOLE_USER}" NFSHomeDirectory | awk '{print $2}')
+
+    run_as_user() { /usr/bin/sudo -u "$CONSOLE_USER" /bin/bash -lc "$*"; }
+
+    # 1. Revoke the device token + remove the CLI, hooks, MCP config and ~/.corridor/.
+    CORRIDOR_BIN="${USER_HOME}/.corridor/bin/corridor"
+    if [ -x "$CORRIDOR_BIN" ]; then
+        run_as_user "'${CORRIDOR_BIN}' uninstall --target ide-extension --non-interactive" || true
+        run_as_user "'${CORRIDOR_BIN}' uninstall --non-interactive" || true
+    else
+        run_as_user "curl -fsSL https://app.corridor.dev/cli/uninstall.sh | bash" || true
+    fi
+
+    # 2. Remove the Corridor IDE extension itself (VS Code / Cursor, if present).
+    for IDE in code cursor; do
+        if run_as_user "command -v ${IDE}" >/dev/null 2>&1; then
+            run_as_user "${IDE} --uninstall-extension corridor.Corridor" || true
+        fi
+    done
+
+    echo "Corridor rollback complete for ${CONSOLE_USER}."
+    exit 0
+    ```
+  </Step>
+
+  <Step title="Create an uninstall policy">
+    Go to **Computers → Policies → New**. Name it `Corridor Uninstall Policy`, add the `Corridor Uninstall Script` under **Scripts**, set the trigger to **Recurring Check-in** with execution frequency **Once per computer**, and scope it to the devices you're rolling back.
+  </Step>
+
+  <Step title="Remove the install policy and profile">
+    After the uninstall has run, unscope or delete the `Corridor Installation Policy` and the `dev.corridor.mdm` configuration profile so devices are not re-provisioned on their next check-in.
+  </Step>
+</Steps>
+
+#### Fleet (macOS only)
+
+<Steps>
+  <Step title="Upload a rollback script">
+    In Fleet, go to **Controls → Scripts** and upload a rollback script whose
+    contents are:
+
+    ```bash theme={null}
+    #!/bin/bash
+    # Corridor Fleet uninstaller (macOS) — reverses fleet-macos.sh.
+    set -u
+
+    CONSOLE_USER=$(/usr/bin/stat -f%Su /dev/console)
+    if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+        echo "No console user logged in; will retry on the next run."
+        exit 0
+    fi
+    USER_HOME=$(/usr/bin/dscl . -read "/Users/${CONSOLE_USER}" NFSHomeDirectory | awk '{print $2}')
+
+    run_as_user() { /usr/bin/sudo -u "$CONSOLE_USER" /bin/bash -lc "$*"; }
+
+    # Revoke the device token and remove the CLI, hooks, MCP config and ~/.corridor/.
+    CORRIDOR_BIN="${USER_HOME}/.corridor/bin/corridor"
+    if [ -x "$CORRIDOR_BIN" ]; then
+        run_as_user "'${CORRIDOR_BIN}' uninstall --target ide-extension --non-interactive" || true
+        run_as_user "'${CORRIDOR_BIN}' uninstall --non-interactive" || true
+    else
+        run_as_user "curl -fsSL https://app.corridor.dev/cli/uninstall.sh | bash" || true
+    fi
+
+    # Remove the Corridor IDE extension itself.
+    for IDE in code cursor windsurf; do
+        if run_as_user "command -v ${IDE}" >/dev/null 2>&1; then
+            run_as_user "${IDE} --uninstall-extension corridor.Corridor" || true
+        fi
+    done
+
+    echo "Corridor rollback complete for ${CONSOLE_USER}."
+    exit 0
+    ```
+  </Step>
+
+  <Step title="Run the rollback">
+    Run it on the hosts you are rolling back, from the host's **Actions → Run
+    script** menu or with `fleetctl run-script`.
+  </Step>
+
+  <Step title="Remove the install script and profile">
+    Once the rollback has run, remove the Corridor script from any policy
+    automation and delete the `dev.corridor.mdm` configuration profile from
+    **Controls → OS settings → Configuration profiles**, so hosts are not
+    re-provisioned. Optionally revoke the Universal Team Token as an org-wide kill
+    switch, as described above.
+  </Step>
+</Steps>
+
+#### Kandji / Iru (macOS only)
+
+Add a **Custom Script** (Execution Frequency: **Run once per device**) whose contents are `curl -fsSL https://app.corridor.dev/cli/uninstall.sh | bash`, assign it to the Blueprint you're rolling back, then remove the Corridor Custom Script and the Global Variables profile from that Blueprint.
+
+#### Intune
+
+Add a platform script that runs the uninstaller, then unassign the install script:
+
+* **macOS** — set **Run script as signed-in user: Yes** and use `curl -fsSL https://app.corridor.dev/cli/uninstall.sh | bash`.
+* **Windows** — set **Run this script using the logged on credentials: Yes** and run the CLI directly: `& "$env:USERPROFILE\.corridor\bin\corridor.exe" uninstall --non-interactive`.
