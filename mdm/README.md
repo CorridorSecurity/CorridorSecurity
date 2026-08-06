@@ -15,6 +15,18 @@ The scripts also download and install the Corridor CLI for the logged-in user, p
 
 > **Windows execution context:** macOS scripts run as root and use `sudo -u "$CURRENT_USER"` to do per-user work as the signed-in user. Windows has no unprivileged equivalent — a SYSTEM-context script cannot drop to the user without their password — so `intune-windows.ps1` must be deployed with Intune's **"Run this script using the logged-on credentials = Yes"** setting so it runs in the signed-in user's context.
 
+## Supported MDMs
+
+| MDM | Platform | Script | Extra files |
+| --- | --- | --- | --- |
+| Microsoft Intune | macOS | `intune-macos.sh` | — |
+| Microsoft Intune | Windows | `intune-windows.ps1` | — |
+| Kandji | macOS | `kandji-macos.sh` | — |
+| Jamf Pro | macOS | `jamf-macos.sh` | `dev.corridor.mdm.plist` (configuration profile) |
+| Fleet | macOS | `fleet-macos.sh` | `fleet-dev.corridor.mdm.mobileconfig` (configuration profile) |
+
+Every script needs the user's email and the device serial number to provision tokens; the scripts differ mainly in how their MDM supplies those two values.
+
 ## Available Scripts
 
 ### `intune-macos.sh` and `intune-windows.ps1`
@@ -35,3 +47,28 @@ For MacOS devices managed by **Kandji**.
 - `CORRIDOR_TEAM_TOKEN` - Your team's Universal Team Token from Corridor settings
 
 The script uses Kandji's global variables (`$EMAIL` and `$SERIAL_NUMBER`) which are injected by Kandji through custom profiles.
+
+### `jamf-macos.sh`
+
+For MacOS devices managed by **Jamf Pro**, deployed as a policy script.
+
+**Requirements:**
+- `CORRIDOR_TEAM_TOKEN` - Your team's Universal Team Token from Corridor settings
+- A configuration profile that pushes `dev.corridor.mdm.plist` (in this directory) to `/Library/Managed Preferences/dev.corridor.mdm.plist`, with Jamf substituting the `UserEmail` and `SerialNumber` values
+
+The script reads the user's email and device serial from the managed plist.
+
+### `fleet-macos.sh`
+
+For MacOS devices managed by **Fleet** ([fleetdm.com](https://fleetdm.com)), run via Fleet scripts (manually, through the API/`fleetctl`, or as a policy automation).
+
+**Requirements:**
+- `CORRIDOR_TEAM_TOKEN` - Your team's Universal Team Token from Corridor settings, stored as a Fleet custom variable named `CORRIDOR_TEAM_TOKEN` (the script references it as `$FLEET_SECRET_CORRIDOR_TEAM_TOKEN`, which Fleet substitutes server-side and masks in its UI and API)
+- `fleet-dev.corridor.mdm.mobileconfig` (in this directory) uploaded under **Controls → OS settings → Configuration profiles** (called "Custom settings" before Fleet 4.84), scoped to the fleet containing your target hosts. It pushes the user's email and device serial to `/Library/Managed Preferences/dev.corridor.mdm.plist` using Fleet's built-in variables (`$FLEET_VAR_HOST_END_USER_IDP_USERNAME` and `$FLEET_VAR_HOST_HARDWARE_SERIAL`)
+- Fleet must know each host's end user (IdP integration or human-to-host mapping), otherwise Fleet cannot resolve the IdP variable and the profile is never delivered
+- The resolved IdP username must be an email address. Fleet itself does not require this and will deliver a non-email username happily, but Corridor maps devices to users by email, so the script rejects anything else
+- Script execution enabled in `fleetd` (enabled by default on hosts with Fleet MDM turned on)
+- An active console session on the Mac. Because Fleet policy automations run unattended, the script skips (exit 0) rather than provisioning to the wrong home directory when nobody is signed in, and the automation picks it up on a later run
+- Optional: set `CORRIDOR_CLI_SHA256` in the script to pin the expected SHA-256 of the Corridor CLI installer. The script logs the observed hash when unset
+
+The script reads the user's email and device serial from the managed plist, mirroring the Jamf Pro flow. It is hardened beyond the other MDM scripts: the team token reaches `curl` through a config file on stdin instead of argv, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted, since Fleet stores script output verbatim.
