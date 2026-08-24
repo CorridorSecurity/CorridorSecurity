@@ -2,9 +2,9 @@
 #
 # Corridor MDM Provisioning Script for Fleet MacOS Devices
 #
-# Detects installed editors (Cursor, VS Code, Windsurf), installs the Corridor
-# extension on each, installs the Corridor CLI, and provisions per-platform API
-# tokens for the signed-in user.
+# Detects installed editors (Cursor, VS Code, Windsurf, Devin Desktop), installs
+# the Corridor extension on each, installs the Corridor CLI, and provisions
+# per-platform API tokens for the signed-in user.
 #
 # Configuration:
 #   CORRIDOR_TEAM_TOKEN - Your team's Universal Team Token (required). Set as a
@@ -21,10 +21,6 @@
 # ============================================================================
 # CONFIGURATION - Replace with your actual values
 # ============================================================================
-# Single-quoted: Fleet substitutes this textually before the host's shell parses
-# the file, so double quotes would let a token with shell metacharacters run.
-CORRIDOR_TEAM_TOKEN='$FLEET_SECRET_CORRIDOR_TEAM_TOKEN'
-
 CORRIDOR_CLI_SHA256=''
 
 # ============================================================================
@@ -41,6 +37,12 @@ LOG_PREFIX="[Corridor MDM]"
 CORRIDOR_API_URL="https://app.corridor.dev/api"
 CORRIDOR_CLI_INSTALL_URL="https://app.corridor.dev/cli/install.sh"
 MANAGED_PLIST="/Library/Managed Preferences/dev.corridor.mdm.plist"
+EXTENSION_INSTALL_TIMEOUT=60
+EXTENSION_PHASE_TIMEOUT=150
+
+# Fleet may run from a directory the console user cannot read; use a stable
+# working directory so child processes do not emit getcwd errors.
+cd /
 
 log_info() {
     echo "$LOG_PREFIX INFO: $1"
@@ -59,9 +61,17 @@ log_success() {
 }
 
 CLI_INSTALLER=""
+CORRIDOR_TOKEN_FILE=""
+EXTENSION_OUTPUT_FILE=""
 cleanup() {
     if [ -n "$CLI_INSTALLER" ]; then
         rm -f "$CLI_INSTALLER"
+    fi
+    if [ -n "$CORRIDOR_TOKEN_FILE" ]; then
+        rm -f "$CORRIDOR_TOKEN_FILE"
+    fi
+    if [ -n "$EXTENSION_OUTPUT_FILE" ]; then
+        rm -f "$EXTENSION_OUTPUT_FILE"
     fi
 }
 trap cleanup EXIT
@@ -96,10 +106,68 @@ redact() {
     printf '%s' "$1" | tr -d '\n' | cut -c1-200 | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g'
 }
 
+kill_process_tree() {
+    local parent_pid="$1"
+    local child_pid
+    for child_pid in $(pgrep -P "$parent_pid" 2>/dev/null); do
+        kill_process_tree "$child_pid"
+    done
+    kill -TERM "$parent_pid" 2>/dev/null || true
+    kill -KILL "$parent_pid" 2>/dev/null || true
+}
+
+run_extension_install() {
+    EXTENSION_OUTPUT_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-extension.XXXXXX")
+    launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
+        env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
+        --install-extension corridor.Corridor --force \
+        > "$EXTENSION_OUTPUT_FILE" 2>&1 &
+    local install_pid=$!
+    local elapsed=0
+    local phase_remaining=$((EXTENSION_PHASE_TIMEOUT - (SECONDS - EXTENSION_PHASE_START)))
+    local install_timeout="$EXTENSION_INSTALL_TIMEOUT"
+    if [ "$phase_remaining" -lt "$install_timeout" ]; then
+        install_timeout="$phase_remaining"
+    fi
+    INSTALL_TIMEOUT_USED="$install_timeout"
+    while kill -0 "$install_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$install_timeout" ]; then
+            kill_process_tree "$install_pid"
+            wait "$install_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$install_pid"
+}
+
+# Quoted heredoc written to a mode-600 temporary file: this mirrors the
+# mechanism proven to work in this Fleet tenant. Reading the single token line
+# strips its trailing newline, then the file is removed immediately.
+ORIGINAL_UMASK=$(umask)
+umask 077
+CORRIDOR_TOKEN_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-team-token.XXXXXX")
+cat <<'FLEET_TOKEN_EOF' > "$CORRIDOR_TOKEN_FILE"
+$FLEET_SECRET_CORRIDOR_TEAM_TOKEN
+FLEET_TOKEN_EOF
+IFS= read -r CORRIDOR_TEAM_TOKEN < "$CORRIDOR_TOKEN_FILE"
+rm -f "$CORRIDOR_TOKEN_FILE"
+CORRIDOR_TOKEN_FILE=""
+umask "$ORIGINAL_UMASK"
+
 # An undefined Fleet variable leaves the literal placeholder in place.
 case "$CORRIDOR_TEAM_TOKEN" in
-    ""|'$FLEET_SECRET_CORRIDOR_TEAM_TOKEN'|"cor-team_...")
-        log_error "CORRIDOR_TEAM_TOKEN is not configured. Define the CORRIDOR_TEAM_TOKEN custom variable in Fleet or set your team token in this script."
+    "")
+        log_error "CORRIDOR_TEAM_TOKEN is not configured: value came through empty (character count: 0). Define the CORRIDOR_TEAM_TOKEN custom variable in Fleet or set your team token in this script."
+        exit 1
+        ;;
+    *FLEET_SECRET_CORRIDOR_TEAM_TOKEN*)
+        log_error "CORRIDOR_TEAM_TOKEN is not configured: Fleet left the placeholder in place (character count: ${#CORRIDOR_TEAM_TOKEN}). Define the CORRIDOR_TEAM_TOKEN custom variable in Fleet or set your team token in this script."
+        exit 1
+        ;;
+    "cor-team_...")
+        log_error "CORRIDOR_TEAM_TOKEN is not configured: documentation placeholder is still present (character count: ${#CORRIDOR_TEAM_TOKEN}). Define the CORRIDOR_TEAM_TOKEN custom variable in Fleet or set your team token in this script."
         exit 1
         ;;
 esac
@@ -149,7 +217,7 @@ fi
 case "$USER_EMAIL" in
     *@*.*) ;;
     *)
-        log_error "Value pushed as UserEmail ('$USER_EMAIL') is not an email address. Fleet's \$FLEET_VAR_HOST_END_USER_IDP_USERNAME resolves to the IdP username, which must be the user's email for Corridor provisioning."
+        log_error "Value pushed as UserEmail ('$USER_EMAIL') is not an email address. Fleet's FLEET_VAR_HOST_END_USER_IDP_USERNAME resolves to the IdP username, which must be the user's email for Corridor provisioning."
         exit 1
         ;;
 esac
@@ -253,13 +321,14 @@ CLI_INSTALLER=""
 # Detect editors and install the Corridor extension
 # ============================================================================
 # bash 3.x compatible - no associative arrays.
-EDITOR_NAMES="Cursor VSCode Windsurf"
+EDITOR_NAMES="Cursor VSCode Windsurf Devin"
 
 get_editor_app_name() {
     case "$1" in
         Cursor)   echo "Cursor.app" ;;
         VSCode)   echo "Visual Studio Code.app" ;;
         Windsurf) echo "Windsurf.app" ;;
+        Devin)    echo "Devin.app" ;;
     esac
 }
 
@@ -268,6 +337,8 @@ get_editor_platform() {
         Cursor)   echo "cursor" ;;
         VSCode)   echo "vscode" ;;
         Windsurf) echo "windsurf" ;;
+        # Placeholder until Corridor adds a dedicated Devin Desktop platform.
+        Devin)    echo "windsurf" ;;
     esac
 }
 
@@ -276,6 +347,7 @@ get_editor_cli() {
         Cursor)   echo "cursor" ;;
         VSCode)   echo "code" ;;
         Windsurf) echo "windsurf" ;;
+        Devin)    echo "devin-desktop" ;;
     esac
 }
 
@@ -301,6 +373,7 @@ get_editor_ext_dir() {
         Cursor)  echo ".cursor/extensions" ;;
         VSCode)  echo ".vscode/extensions" ;;
         Windsurf) echo ".windsurf/extensions" ;;
+        Devin)   echo ".devin/extensions" ;;
     esac
 }
 
@@ -327,22 +400,44 @@ INSTALLED_EDITORS=$(echo "$INSTALLED_EDITORS" | sed 's/^ *//')
 # One platform per installed editor, plus "cli" if the CLI installed.
 PROVISION_PLATFORMS=""
 for editor in $INSTALLED_EDITORS; do
-    PROVISION_PLATFORMS="$PROVISION_PLATFORMS $(get_editor_platform "$editor")"
+    PLATFORM=$(get_editor_platform "$editor")
+    case " $PROVISION_PLATFORMS " in
+        *" $PLATFORM "*) ;;
+        *) PROVISION_PLATFORMS="$PROVISION_PLATFORMS $PLATFORM" ;;
+    esac
 done
 if [ "$CLI_INSTALLED" = "true" ]; then
-    PROVISION_PLATFORMS="$PROVISION_PLATFORMS cli"
+    case " $PROVISION_PLATFORMS " in
+        *" cli "*) ;;
+        *) PROVISION_PLATFORMS="$PROVISION_PLATFORMS cli" ;;
+    esac
 fi
 PROVISION_PLATFORMS=$(echo "$PROVISION_PLATFORMS" | sed 's/^ *//')
 
 if [ -z "$INSTALLED_EDITORS" ]; then
-    log_info "No supported editors (Cursor, VS Code, Windsurf) are installed. Skipping Corridor extension installation."
+    log_info "No supported editors (Cursor, VS Code, Windsurf, Devin) are installed. Skipping Corridor extension installation."
     if [ -z "$PROVISION_PLATFORMS" ]; then
         exit 0
     fi
 fi
 
+skip_remaining_editors() {
+    if [ -n "$REMAINING_EDITORS" ]; then
+        log_warn "Editor extension phase budget of ${EXTENSION_PHASE_TIMEOUT}s exhausted; skipping editors: $REMAINING_EDITORS. They will be retried on the next check-in."
+    fi
+}
+
+EXTENSION_PHASE_START=$SECONDS
+REMAINING_EDITORS="$INSTALLED_EDITORS"
 for editor in $INSTALLED_EDITORS; do
     [ -z "$editor" ] && continue
+
+    if [ "$((SECONDS - EXTENSION_PHASE_START))" -ge "$EXTENSION_PHASE_TIMEOUT" ]; then
+        skip_remaining_editors
+        break
+    fi
+    REMAINING_EDITORS="${REMAINING_EDITORS#"$editor"}"
+    REMAINING_EDITORS="${REMAINING_EDITORS# }"
 
     if echo "$EDITOR_PATHS" | grep -q "$editor:alternative"; then
         CLI_PATH=$(get_editor_cli_path_alternative "$editor")
@@ -365,7 +460,20 @@ for editor in $INSTALLED_EDITORS; do
 
     # NODE_USE_SYSTEM_CA=1 adds the macOS System keychain to the editor's bundled
     # CA list, so installs work behind TLS-intercepting proxies (Zscaler, etc.).
-    INSTALL_OUTPUT=$(sudo -u "$CURRENT_USER" env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" --install-extension corridor.Corridor --force 2>&1) || true
+    INSTALL_STATUS=0
+    run_extension_install || INSTALL_STATUS=$?
+    INSTALL_OUTPUT=$(cat "$EXTENSION_OUTPUT_FILE")
+    rm -f "$EXTENSION_OUTPUT_FILE"
+    EXTENSION_OUTPUT_FILE=""
+
+    if [ "$INSTALL_STATUS" -eq 124 ]; then
+        log_warn "Timed out installing the Corridor extension for $editor after ${INSTALL_TIMEOUT_USED}s; it will be retried on the next check-in."
+        if [ "$((SECONDS - EXTENSION_PHASE_START))" -ge "$EXTENSION_PHASE_TIMEOUT" ]; then
+            skip_remaining_editors
+            break
+        fi
+        continue
+    fi
 
     if echo "$INSTALL_OUTPUT" | grep -qi "already installed"; then
         log_info "Corridor extension is already installed for $editor"
@@ -385,6 +493,7 @@ done
 # Provision an API token per platform
 # ============================================================================
 log_info "Provisioning user with Corridor..."
+PLATFORM_FAILURE=0
 
 for PLATFORM in $PROVISION_PLATFORMS; do
     PLATFORM_CONFIG_DIR="$CORRIDOR_CONFIG_DIR/$PLATFORM"
@@ -414,8 +523,9 @@ for PLATFORM in $PROVISION_PLATFORMS; do
     BODY=$(echo "$RESPONSE" | sed '$d')
 
     if [ "$HTTP_CODE" != "200" ]; then
-        log_error "Failed to provision token for $PLATFORM. HTTP $HTTP_CODE: $(redact "$BODY")"
-        exit 1
+        log_warn "Failed to provision token for $PLATFORM. HTTP $HTTP_CODE: $(redact "$BODY")"
+        PLATFORM_FAILURE=1
+        continue
     fi
 
     API_TOKEN=$(printf '%s' "$BODY" | sed -n 's/.*"apiToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
@@ -453,7 +563,11 @@ for PLATFORM in $PROVISION_PLATFORMS; do
     log_info "Pending token for $PLATFORM stored in $PLATFORM_CONFIG_DIR/pending-token"
 done
 
-log_success "User provisioned successfully!"
+if [ "$PLATFORM_FAILURE" -eq 0 ]; then
+    log_success "User provisioned successfully!"
+else
+    log_warn "One or more platform token provisions failed; successful platforms were processed."
+fi
 log_info "The Corridor extension will migrate tokens to secure storage on next launch of that editor"
 
 # ============================================================================
@@ -470,6 +584,11 @@ if [ "$CLI_INSTALLED" = "true" ]; then
     else
         log_info "Corridor agent plugin setup skipped or incomplete (non-fatal — e.g. no claude/droid/codex in PATH, or install did not finish). See corridor output above for the cause."
     fi
+fi
+
+if [ "$PLATFORM_FAILURE" -ne 0 ]; then
+    log_error "Corridor provisioning completed with one or more platform token failures."
+    exit 1
 fi
 
 log_success "Corridor MDM provisioning complete!"
