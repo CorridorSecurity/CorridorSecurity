@@ -4,7 +4,8 @@
 #
 # Detects installed editors (Cursor, VS Code, Windsurf, Devin Desktop), installs
 # the Corridor extension on each, installs the Corridor CLI, and provisions
-# per-platform API tokens for the signed-in user.
+# per-platform API tokens for the signed-in user. When nobody is signed in,
+# it provisions the local account named by the profile email instead.
 #
 # Configuration:
 #   CORRIDOR_TEAM_TOKEN - Your team's Universal Team Token (required). Set as a
@@ -100,6 +101,107 @@ is_safe_username() {
     esac
 }
 
+# A person at the console. UID 500 stays included so an already-signed-in
+# account is unchanged. System accounts and Setup Assistant are not.
+console_user_is_human() {
+    local user="$1"
+    local uid="$2"
+    case "$user" in
+        ""|root|_*) return 1 ;;
+    esac
+    if ! is_safe_username "$user"; then
+        return 1
+    fi
+    case "$uid" in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+    if [ "$uid" -lt 500 ]; then
+        return 1
+    fi
+    return 0
+}
+
+dscl_list_unique_ids() {
+    dscl . -list /Users UniqueID
+}
+
+flatten_nfs_home() {
+    tr '\n' ' ' | sed 's/^NFSHomeDirectory: *//; s/ *$//'
+}
+
+dscl_nfs_home() {
+    dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | flatten_nfs_home
+}
+
+path_owner() {
+    stat -f '%u' "$1" 2>/dev/null || true
+}
+
+# One short name per line. UID 501+, real directory, owned by that uid.
+collect_local_accounts() {
+    local name uid home owner
+    while read -r name uid rest; do
+        [ -n "$name" ] || continue
+        case "$uid" in
+            ""|*[!0-9]*) continue ;;
+        esac
+        if [ "$uid" -lt 501 ]; then
+            continue
+        fi
+        case "$name" in
+            _*) continue ;;
+        esac
+        if ! is_safe_username "$name"; then
+            continue
+        fi
+        home=$(dscl_nfs_home "$name") || home=""
+        if [ -z "$home" ] || [ -L "$home" ] || [ ! -d "$home" ]; then
+            continue
+        fi
+        owner=$(path_owner "$home") || owner=""
+        if [ "$owner" != "$uid" ]; then
+            continue
+        fi
+        printf '%s\n' "$name"
+    done <<EOF
+$(dscl_list_unique_ids 2>/dev/null || true)
+EOF
+}
+
+# stdin: short names from collect_local_accounts. Prints the chosen name.
+# Email match wins. Otherwise the only candidate. Anything else fails.
+choose_offline_user() {
+    local email_local="$1"
+    local email_key name name_key match only
+    local match_count=0
+    local only_count=0
+    email_key=$(printf '%s' "$email_local" | tr '[:upper:]' '[:lower:]')
+    match=""
+    only=""
+    while IFS= read -r name || [ -n "$name" ]; do
+        [ -n "$name" ] || continue
+        only_count=$((only_count + 1))
+        only="$name"
+        name_key=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+        if [ "$name_key" = "$email_key" ]; then
+            match_count=$((match_count + 1))
+            match="$name"
+        fi
+    done
+    if [ "$match_count" -eq 1 ]; then
+        printf '%s\n' "$match"
+        return 0
+    fi
+    if [ "$match_count" -gt 1 ]; then
+        return 1
+    fi
+    if [ "$only_count" -eq 1 ]; then
+        printf '%s\n' "$only"
+        return 0
+    fi
+    return 1
+}
+
 # Fleet stores script output verbatim and does not redact secrets from it.
 # Team tokens use cor-…; minted API tokens use cor_… — both must be scrubbed.
 redact() {
@@ -118,10 +220,19 @@ kill_process_tree() {
 
 run_extension_install() {
     EXTENSION_OUTPUT_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-extension.XXXXXX")
-    launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
-        env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
-        --install-extension corridor.Corridor --force \
-        > "$EXTENSION_OUTPUT_FILE" 2>&1 &
+    # No GUI session before first login. launchctl asuser fails there.
+    if launchctl print "gui/$CURRENT_USER_UID" >/dev/null 2>&1; then
+        launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
+            env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
+            --install-extension corridor.Corridor --force \
+            > "$EXTENSION_OUTPUT_FILE" 2>&1 &
+    else
+        log_info "No GUI session for '$CURRENT_USER'. Installing the extension without launchctl."
+        sudo -u "$CURRENT_USER" \
+            env HOME="$USER_HOME" NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
+            --install-extension corridor.Corridor --force \
+            > "$EXTENSION_OUTPUT_FILE" 2>&1 &
+    fi
     local install_pid=$!
     local elapsed=0
     local phase_remaining=$((EXTENSION_PHASE_TIMEOUT - (SECONDS - EXTENSION_PHASE_START)))
@@ -141,6 +252,11 @@ run_extension_install() {
     done
     wait "$install_pid"
 }
+
+# Tests source this file and stop before the token file and provisioning.
+if [ "${CORRIDOR_FLEET_TEST_SOURCE:-}" = "1" ]; then
+    return 0
+fi
 
 # Quoted heredoc written to a mode-600 temporary file: this mirrors the
 # mechanism proven to work in this Fleet tenant. Reading the single token line
@@ -226,23 +342,29 @@ log_info "User email: $USER_EMAIL"
 # ============================================================================
 # Resolve the target user
 # ============================================================================
-# Console owner only. A "most recent GUI user" fallback would provision the
-# MDM-assigned user's token into whichever account last logged in.
+# Signed-in user when there is one. Otherwise the account named by the email,
+# or the only UID 501+ account with a home it owns. Exit 1 when that choice
+# is not unique, so Fleet records a failure and can retry.
 CURRENT_USER=$(stat -f "%Su" /dev/console)
+CURRENT_USER_UID=$(id -u "$CURRENT_USER" 2>/dev/null || echo "")
+EMAIL_LOCAL_PART="${USER_EMAIL%%@*}"
 
-case "$CURRENT_USER" in
-    ""|root|_*)
-        log_info "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Skipping provisioning; this run will be retried on the next check-in."
-        exit 0
-        ;;
-esac
+if ! console_user_is_human "$CURRENT_USER" "$CURRENT_USER_UID"; then
+    log_info "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Selecting a local account."
+    ACCOUNTS=$(collect_local_accounts) || ACCOUNTS=""
+    if ! CHOSEN=$(printf '%s\n' "$ACCOUNTS" | choose_offline_user "$EMAIL_LOCAL_PART"); then
+        log_error "Could not choose one local account for '$USER_EMAIL' (console owner: '${CURRENT_USER:-unknown}'). Refusing to provision."
+        exit 1
+    fi
+    CURRENT_USER="$CHOSEN"
+    CURRENT_USER_UID=$(id -u "$CURRENT_USER" 2>/dev/null || echo "")
+fi
 
 if ! is_safe_username "$CURRENT_USER"; then
     log_error "Console user name '$CURRENT_USER' contains unexpected characters. Refusing to provision."
     exit 1
 fi
 
-CURRENT_USER_UID=$(id -u "$CURRENT_USER" 2>/dev/null || echo "")
 case "$CURRENT_USER_UID" in
     ""|*[!0-9]*)
         log_error "Could not resolve a numeric UID for console user '$CURRENT_USER'."
@@ -250,8 +372,8 @@ case "$CURRENT_USER_UID" in
         ;;
 esac
 if [ "$CURRENT_USER_UID" -lt 500 ]; then
-    log_info "Console user '$CURRENT_USER' is a system account (UID $CURRENT_USER_UID). Skipping provisioning."
-    exit 0
+    log_error "Account '$CURRENT_USER' is a system account (UID $CURRENT_USER_UID). Refusing to provision."
+    exit 1
 fi
 
 # dscl wraps long values onto a second line, so flatten before stripping the key.
@@ -267,8 +389,9 @@ if [ "$(stat -f '%u' "$USER_HOME")" != "$CURRENT_USER_UID" ]; then
 fi
 log_info "Current User: $CURRENT_USER ($USER_HOME)"
 
-EMAIL_LOCAL_PART="${USER_EMAIL%%@*}"
-if [ "$CURRENT_USER" != "$EMAIL_LOCAL_PART" ]; then
+USER_KEY=$(printf '%s' "$CURRENT_USER" | tr '[:upper:]' '[:lower:]')
+EMAIL_KEY=$(printf '%s' "$EMAIL_LOCAL_PART" | tr '[:upper:]' '[:lower:]')
+if [ "$USER_KEY" != "$EMAIL_KEY" ]; then
     log_warn "Console user '$CURRENT_USER' does not match the MDM-assigned user '$USER_EMAIL'. Tokens for $USER_EMAIL will be written to $USER_HOME - confirm this device is assigned to the person using it."
 fi
 
