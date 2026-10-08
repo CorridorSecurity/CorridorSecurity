@@ -146,6 +146,27 @@ else
     ok "script no longer skips with a success exit"
 fi
 
+if nothing_was_installed "" ""; then
+    ok "no CLI and no editor is a failed install"
+else
+    bad "no CLI and no editor is a failed install"
+fi
+if nothing_was_installed "" "cli"; then
+    bad "CLI alone is treated as nothing installed"
+else
+    ok "CLI alone is an install"
+fi
+if nothing_was_installed "Cursor" ""; then
+    bad "an editor alone is treated as nothing installed"
+else
+    ok "an editor alone is an install"
+fi
+if grep -q "Nothing was installed. The Corridor CLI did not install" "$SCRIPT_DIR/fleet-macos.sh"; then
+    ok "empty install tells Fleet it failed"
+else
+    bad "empty install tells Fleet it failed"
+fi
+
 rm -rf "$TMP"
 
 if [ "$FAIL" -ne 0 ]; then

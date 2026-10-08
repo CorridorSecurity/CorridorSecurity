@@ -202,6 +202,12 @@ choose_offline_user() {
     return 1
 }
 
+# True when this run installed neither the CLI nor an editor.
+# That result has to exit 1. Exit 0 makes Fleet record success.
+nothing_was_installed() {
+    [ -z "$1" ] && [ -z "$2" ]
+}
+
 # Fleet stores script output verbatim and does not redact secrets from it.
 # Team tokens use cor-…; minted API tokens use cor_… — both must be scrubbed.
 redact() {
@@ -539,8 +545,9 @@ PROVISION_PLATFORMS=$(echo "$PROVISION_PLATFORMS" | sed 's/^ *//')
 
 if [ -z "$INSTALLED_EDITORS" ]; then
     log_info "No supported editors (Cursor, VS Code, Windsurf, Devin) are installed. Skipping Corridor extension installation."
-    if [ -z "$PROVISION_PLATFORMS" ]; then
-        exit 0
+    if nothing_was_installed "$INSTALLED_EDITORS" "$PROVISION_PLATFORMS"; then
+        log_error "Nothing was installed. The Corridor CLI did not install, and no supported editor is on this Mac. Exiting 1 so Fleet retries instead of recording success."
+        exit 1
     fi
 fi
 
