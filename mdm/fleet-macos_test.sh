@@ -68,7 +68,7 @@ other"
 assert_eq "email match ignores case" "$CHOOSE_RC:$CHOOSE_OUT" "0:ada"
 
 choose "nomatch" "only"
-assert_eq "only account when email does not match" "$CHOOSE_RC:$CHOOSE_OUT" "0:only"
+assert_eq "lone account without an email match" "$CHOOSE_RC" "1"
 
 choose "nomatch" "ada
 other"
@@ -85,7 +85,7 @@ FLAT=$(printf 'NFSHomeDirectory: /Users/ada\n' | flatten_nfs_home)
 assert_eq "dscl home prefix is stripped" "$FLAT" "/Users/ada"
 
 TMP=$(mktemp -d)
-mkdir -p "$TMP/ada" "$TMP/other"
+mkdir -p "$TMP/ada" "$TMP/other" "$TMP/first"
 ln -s "$TMP/ada" "$TMP/linked"
 
 dscl_list_unique_ids() {
@@ -95,6 +95,7 @@ dscl_list_unique_ids() {
         "_mbsetupuser 248" \
         "root 0" \
         "low 499" \
+        "first 500" \
         "bad name 504" \
         "linked 505" \
         "missing 506" \
@@ -105,6 +106,7 @@ dscl_nfs_home() {
     case "$1" in
         ada) printf '%s\n' "$TMP/ada" ;;
         other) printf '%s\n' "$TMP/other" ;;
+        first) printf '%s\n' "$TMP/first" ;;
         linked) printf '%s\n' "$TMP/linked" ;;
         missing) printf '%s\n' "$TMP/missing" ;;
         stolen) printf '%s\n' "$TMP/ada" ;;
@@ -116,13 +118,15 @@ path_owner() {
     case "$1" in
         "$TMP/ada") printf '%s\n' "501" ;;
         "$TMP/other") printf '%s\n' "502" ;;
+        "$TMP/first") printf '%s\n' "500" ;;
         *) printf '%s\n' "0" ;;
     esac
 }
 
 COLLECTED=$(collect_local_accounts)
-assert_eq "collector keeps owned uid 501+ homes" "$COLLECTED" "ada
-other"
+assert_eq "collector keeps owned uid 500+ homes" "$COLLECTED" "ada
+other
+first"
 
 choose "other" "$COLLECTED"
 assert_eq "collector feed prefers email" "$CHOOSE_RC:$CHOOSE_OUT" "0:other"
@@ -137,8 +141,11 @@ path_owner() {
     printf '%s\n' "501"
 }
 COLLECTED=$(collect_local_accounts)
+choose "solo" "$COLLECTED"
+assert_eq "setup assistant picks the email match" "$CHOOSE_RC:$CHOOSE_OUT" "0:solo"
+
 choose "someoneelse" "$COLLECTED"
-assert_eq "setup assistant falls back to the only account" "$CHOOSE_RC:$CHOOSE_OUT" "0:solo"
+assert_eq "setup assistant refuses a lone mismatched account" "$CHOOSE_RC" "1"
 
 if grep -q "Skipping provisioning" "$SCRIPT_DIR/fleet-macos.sh"; then
     bad "script still skips with exit 0"

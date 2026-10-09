@@ -137,7 +137,7 @@ path_owner() {
     stat -f '%u' "$1" 2>/dev/null || true
 }
 
-# One short name per line. UID 501+, real directory, owned by that uid.
+# One short name per line. UID 500+, real directory, owned by that uid.
 collect_local_accounts() {
     local name uid home owner
     while read -r name uid rest; do
@@ -145,7 +145,7 @@ collect_local_accounts() {
         case "$uid" in
             ""|*[!0-9]*) continue ;;
         esac
-        if [ "$uid" -lt 501 ]; then
+        if [ "$uid" -lt 500 ]; then
             continue
         fi
         case "$name" in
@@ -169,19 +169,16 @@ EOF
 }
 
 # stdin: short names from collect_local_accounts. Prints the chosen name.
-# Email match wins. Otherwise the only candidate. Anything else fails.
+# Only an email match counts. A lone account with another name could belong
+# to someone else, such as an IT admin, so it fails and Fleet retries.
 choose_offline_user() {
     local email_local="$1"
-    local email_key name name_key match only
+    local email_key name name_key match
     local match_count=0
-    local only_count=0
     email_key=$(printf '%s' "$email_local" | tr '[:upper:]' '[:lower:]')
     match=""
-    only=""
     while IFS= read -r name || [ -n "$name" ]; do
         [ -n "$name" ] || continue
-        only_count=$((only_count + 1))
-        only="$name"
         name_key=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
         if [ "$name_key" = "$email_key" ]; then
             match_count=$((match_count + 1))
@@ -190,13 +187,6 @@ choose_offline_user() {
     done
     if [ "$match_count" -eq 1 ]; then
         printf '%s\n' "$match"
-        return 0
-    fi
-    if [ "$match_count" -gt 1 ]; then
-        return 1
-    fi
-    if [ "$only_count" -eq 1 ]; then
-        printf '%s\n' "$only"
         return 0
     fi
     return 1
@@ -348,9 +338,9 @@ log_info "User email: $USER_EMAIL"
 # ============================================================================
 # Resolve the target user
 # ============================================================================
-# Signed-in user when there is one. Otherwise the account named by the email,
-# or the only UID 501+ account with a home it owns. Exit 1 when that choice
-# is not unique, so Fleet records a failure and can retry.
+# Signed-in user when there is one. Otherwise the local account whose short
+# name matches the email. Exit 1 when there is no single match, so Fleet
+# records a failure and can retry.
 CURRENT_USER=$(stat -f "%Su" /dev/console)
 CURRENT_USER_UID=$(id -u "$CURRENT_USER" 2>/dev/null || echo "")
 EMAIL_LOCAL_PART="${USER_EMAIL%%@*}"
