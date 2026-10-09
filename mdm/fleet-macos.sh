@@ -232,8 +232,8 @@ CURRENT_USER=$(stat -f "%Su" /dev/console)
 
 case "$CURRENT_USER" in
     ""|root|_*)
-        log_info "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Skipping provisioning; this run will be retried on the next check-in."
-        exit 0
+        log_error "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Corridor installs per user, so run this script while the developer is signed in. Exiting 1 so Fleet records a failure and can retry."
+        exit 1
         ;;
 esac
 
@@ -250,8 +250,8 @@ case "$CURRENT_USER_UID" in
         ;;
 esac
 if [ "$CURRENT_USER_UID" -lt 500 ]; then
-    log_info "Console user '$CURRENT_USER' is a system account (UID $CURRENT_USER_UID). Skipping provisioning."
-    exit 0
+    log_error "Console user '$CURRENT_USER' is a system account (UID $CURRENT_USER_UID). Refusing to provision."
+    exit 1
 fi
 
 # dscl wraps long values onto a second line, so flatten before stripping the key.
