@@ -68,7 +68,7 @@ For MacOS devices managed by **Fleet** ([fleetdm.com](https://fleetdm.com)), run
 - Fleet must know each host's end user (IdP integration or human-to-host mapping), otherwise Fleet cannot resolve the IdP variable and the profile is never delivered
 - The resolved IdP username must be an email address. Fleet itself does not require this and will deliver a non-email username happily, but Corridor maps devices to users by email, so the script rejects anything else
 - Script execution enabled in `fleetd` (enabled by default on hosts with Fleet MDM turned on)
-- An active console session on the Mac. Because Fleet policy automations run unattended, the script skips (exit 0) rather than provisioning to the wrong home directory when nobody is signed in, and the automation picks it up on a later run
+- The developer signed in at the Mac. Corridor installs per user, into the home directory of the user who owns the console. When nobody is signed in, the script exits 1 instead of guessing an account. Fleet retries a failed script up to 3 times. Set the policy's `continuous_automations_enabled` to true so it runs again on later check-ins until the developer is signed in
 - Optional: set `CORRIDOR_CLI_SHA256` in the script to pin the expected SHA-256 of the Corridor CLI installer. The script logs the observed hash when unset
 
 The script reads the user's email and device serial from the managed plist, mirroring the Jamf Pro flow. It is hardened beyond the other MDM scripts: the team token reaches `curl` through a config file on stdin instead of argv, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted, since Fleet stores script output verbatim.
