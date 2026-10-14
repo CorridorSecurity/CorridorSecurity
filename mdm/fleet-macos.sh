@@ -22,6 +22,8 @@
 # CONFIGURATION - Replace with your actual values
 # ============================================================================
 CORRIDOR_CLI_SHA256=''
+# Local IT admin account to skip when choosing an account before first login.
+CORRIDOR_ADMIN_ACCOUNT='admin'
 
 # ============================================================================
 # SCRIPT LOGIC - Do not modify below this line
@@ -226,14 +228,30 @@ log_info "User email: $USER_EMAIL"
 # ============================================================================
 # Resolve the target user
 # ============================================================================
-# Console owner only. A "most recent GUI user" fallback would provision the
-# MDM-assigned user's token into whichever account last logged in.
+# The console owner when someone is signed in. Before first login, the only
+# folder in /Users that is not the IT admin account. Edit this block to match
+# how your Macs are set up.
 CURRENT_USER=$(stat -f "%Su" /dev/console)
 
 case "$CURRENT_USER" in
     ""|root|_*)
-        log_error "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Corridor installs per user, so run this script while the developer is signed in. Exiting 1 so Fleet records a failure and can retry."
-        exit 1
+        CANDIDATES=""
+        for USER_DIR in /Users/*/; do
+            USER_DIR_NAME=$(basename "$USER_DIR")
+            case "$USER_DIR_NAME" in
+                Shared|Guest|"Deleted Users"|"$CORRIDOR_ADMIN_ACCOUNT") continue ;;
+            esac
+            CANDIDATES="$CANDIDATES $USER_DIR_NAME"
+        done
+        CANDIDATES="${CANDIDATES# }"
+        case "$CANDIDATES" in
+            ""|*" "*)
+                log_error "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'), and /Users does not have exactly one folder besides '$CORRIDOR_ADMIN_ACCOUNT' (found: '${CANDIDATES:-none}'). Exiting 1 so Fleet records a failure and can retry."
+                exit 1
+                ;;
+        esac
+        log_warn "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Installing for '$CANDIDATES', the only folder in /Users besides '$CORRIDOR_ADMIN_ACCOUNT'."
+        CURRENT_USER="$CANDIDATES"
         ;;
 esac
 
