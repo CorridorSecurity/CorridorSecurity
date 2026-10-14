@@ -226,14 +226,20 @@ log_info "User email: $USER_EMAIL"
 # ============================================================================
 # Resolve the target user
 # ============================================================================
-# Console owner only. A "most recent GUI user" fallback would provision the
-# MDM-assigned user's token into whichever account last logged in.
+# The console owner when someone is signed in. Before first login, the only
+# account with a UID above 500. Edit this block to match how your Macs are set up.
 CURRENT_USER=$(stat -f "%Su" /dev/console)
 
 case "$CURRENT_USER" in
     ""|root|_*)
-        log_error "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Corridor installs per user, so run this script while the developer is signed in. Exiting 1 so Fleet records a failure and can retry."
-        exit 1
+        CANDIDATES=$(dscl . -list /Users UniqueID 2>/dev/null \
+            | awk '$2 > 500 && $1 !~ /^_/ { print $1 }') || CANDIDATES=""
+        if [ "$(printf '%s\n' "$CANDIDATES" | grep -c .)" -ne 1 ]; then
+            log_error "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'), and this Mac does not have exactly one account with a UID above 500. Exiting 1 so Fleet records a failure and can retry."
+            exit 1
+        fi
+        log_warn "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Installing for '$CANDIDATES', the only account with a UID above 500."
+        CURRENT_USER="$CANDIDATES"
         ;;
 esac
 
