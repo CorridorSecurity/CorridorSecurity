@@ -13,6 +13,18 @@ These scripts automate the deployment of the Corridor extension to developer mac
 
 The scripts also download and install the Corridor CLI for the logged-in user, provision a `cli` API token, and run `corridor install --yes` to set up agent plugins (Claude Code, Factory Droid, Codex). On macOS this uses [install.sh](https://app.corridor.dev/cli/install.sh) (`curl -fsSL https://app.corridor.dev/cli/install.sh | bash`); on Windows it uses [install.ps1](https://app.corridor.dev/cli/install.ps1).
 
+## How the scripts split the work with the CLI
+
+The scripts do the parts that need MDM context: they read the user's email and the device serial, find the signed-in user, and download and verify the Corridor CLI as that user. They then hand the rest to the CLI:
+
+```bash
+corridor mdm provision --email <email> --serial <serial> --api-url <url>
+```
+
+It runs as the signed-in user, never as root or LocalSystem. The team token goes on its stdin, never in argv. The command detects editors, installs the extension, mints one token per platform, writes the pending tokens, and runs `corridor install --yes`. It exits 1 on any failure, so the MDM records a failure and retries.
+
+Each script keeps its older in-script path as a fallback. It runs when the installed CLI is older than `CORRIDOR_MIN_PROVISION_VERSION` (the first release with `corridor mdm provision`), or when the CLI did not install. On macOS that path lives in `src/macos/legacy-provision.sh`. Inside a WSL distro whose default user is root, the script also takes the older path, because the CLI refuses to run as root.
+
 > **Windows execution context:** macOS scripts run as root and use `sudo -u "$CURRENT_USER"` to do per-user work as the signed-in user. Windows has no unprivileged equivalent — a SYSTEM-context script cannot drop to the user without their password — so `intune-windows.ps1` must be deployed with Intune's **"Run this script using the logged-on credentials = Yes"** setting so it runs in the signed-in user's context.
 
 ## Supported MDMs
@@ -32,7 +44,7 @@ The macOS scripts share one hardened implementation. Notes for all of them:
 - Corridor installs per user, into the home directory of the user who owns the console. When nobody is signed in, the script exits 1 instead of guessing an account. Configure your MDM to retry failed runs: a Retry Event on the Jamf Pro policy, "Max number of times to retry if script fails" in Intune, or continuous automations in Fleet.
 - The scripts read managed plists with `plutil -extract ... raw`, which needs macOS 12 or later.
 - Optional: set `CORRIDOR_CLI_SHA256` near the top of the script to pin the expected SHA-256 of the Corridor CLI installer. The script logs the observed hash when it is unset.
-- The team token reaches `curl` through a config file on stdin instead of argv, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted.
+- The team token reaches `corridor mdm provision` (or, on the fallback path, `curl`) on stdin instead of argv, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted.
 
 ## Available Scripts
 
@@ -82,7 +94,7 @@ The script reads the user's email and device serial from the managed plist, mirr
 
 ## Editing these scripts
 
-The four macOS scripts are generated from the templates in `src/macos/` (shared logic in `common.sh` and `prelude.sh`, MDM-specific inputs in `kandji.sh`, `jamf.sh`, `fleet.sh`, and `intune.sh`). Edit the source, then run `scripts/build.sh` to regenerate `mdm/*-macos.sh`. Do not edit the generated files by hand.
+The four macOS scripts are generated from the templates in `src/macos/` (shared logic in `common.sh` and `prelude.sh`, the pre-CLI fallback in `legacy-provision.sh`, MDM-specific inputs in `kandji.sh`, `jamf.sh`, `fleet.sh`, and `intune.sh`). Edit the source, then run `scripts/build.sh` to regenerate `mdm/*-macos.sh`. Do not edit the generated files by hand.
 
 Enable the pre-commit hook, which rebuilds and stages the generated files, with `git config core.hooksPath .githooks`. Stage or stash changes to generator inputs and generated scripts before committing. The hook rejects unstaged changes and untracked generator inputs.
 

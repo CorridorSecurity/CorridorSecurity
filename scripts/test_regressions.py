@@ -63,7 +63,7 @@ USER_EMAIL=review@example.test
 
 class ExtensionRetryTests(unittest.TestCase):
     def test_install_outcomes_preserve_token_provisioning(self):
-        common = (ROOT / "src/macos/common.sh").read_text()
+        common = (ROOT / "src/macos/legacy-provision.sh").read_text()
         section = common[common.index("skip_remaining_editors() {"):]
         cases = (
             ("success", 0, ["Cursor", "VSCode"]),
@@ -131,8 +131,8 @@ class PreCommitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_rebuilds_fully_staged_source(self):
-        self.change_timeout("src/macos/prelude.sh", 60, 61)
-        self.git("add", "src/macos/prelude.sh")
+        self.change_timeout("src/macos/legacy-provision.sh", 60, 61)
+        self.git("add", "src/macos/legacy-provision.sh")
         result = self.hook()
         self.assertEqual(result.returncode, 0, result.stderr)
         for path in GENERATED:
@@ -140,9 +140,9 @@ class PreCommitTests(unittest.TestCase):
         self.assert_index_builds()
 
     def test_rejects_partially_staged_source_without_rebuilding(self):
-        self.change_timeout("src/macos/prelude.sh", 60, 61)
-        self.git("add", "src/macos/prelude.sh")
-        self.change_timeout("src/macos/prelude.sh", 61, 62)
+        self.change_timeout("src/macos/legacy-provision.sh", 60, 61)
+        self.git("add", "src/macos/legacy-provision.sh")
+        self.change_timeout("src/macos/legacy-provision.sh", 61, 62)
         outputs = {path: (self.repo / path).read_text() for path in GENERATED}
         result = self.hook()
         self.assertNotEqual(result.returncode, 0)
@@ -176,8 +176,8 @@ class PreCommitTests(unittest.TestCase):
         self.assertNotEqual(self.hook().returncode, 0)
 
     def test_accepts_current_generated_only_changes(self):
-        self.change_timeout("src/macos/prelude.sh", 60, 61)
-        self.git("add", "src/macos/prelude.sh")
+        self.change_timeout("src/macos/legacy-provision.sh", 60, 61)
+        self.git("add", "src/macos/legacy-provision.sh")
         self.commit()
         self.build()
         self.git("add", *GENERATED)

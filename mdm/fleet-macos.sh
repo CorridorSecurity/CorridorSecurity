@@ -37,8 +37,8 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 LOG_PREFIX="[Corridor MDM]"
 CORRIDOR_API_URL="https://app.corridor.dev/api"
 CORRIDOR_CLI_INSTALL_URL="https://app.corridor.dev/cli/install.sh"
-EXTENSION_INSTALL_TIMEOUT=60
-EXTENSION_PHASE_TIMEOUT=150
+# First CLI release with `corridor mdm provision`. Older CLIs use the in-script path.
+CORRIDOR_MIN_PROVISION_VERSION="0.0.91"
 
 # The MDM agent may run from a directory the console user cannot read; use a stable
 # working directory so child processes do not emit getcwd errors.
@@ -104,42 +104,6 @@ is_safe_username() {
 # Team tokens use cor-…; minted API tokens use cor_… — both must be scrubbed.
 redact() {
     printf '%s' "$1" | tr -d '\n' | cut -c1-200 | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g'
-}
-
-kill_process_tree() {
-    local parent_pid="$1"
-    local child_pid
-    for child_pid in $(pgrep -P "$parent_pid" 2>/dev/null); do
-        kill_process_tree "$child_pid"
-    done
-    kill -TERM "$parent_pid" 2>/dev/null || true
-    kill -KILL "$parent_pid" 2>/dev/null || true
-}
-
-run_extension_install() {
-    EXTENSION_OUTPUT_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-extension.XXXXXX")
-    launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
-        env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
-        --install-extension corridor.Corridor --force \
-        > "$EXTENSION_OUTPUT_FILE" 2>&1 &
-    local install_pid=$!
-    local elapsed=0
-    local phase_remaining=$((EXTENSION_PHASE_TIMEOUT - (SECONDS - EXTENSION_PHASE_START)))
-    local install_timeout="$EXTENSION_INSTALL_TIMEOUT"
-    if [ "$phase_remaining" -lt "$install_timeout" ]; then
-        install_timeout="$phase_remaining"
-    fi
-    INSTALL_TIMEOUT_USED="$install_timeout"
-    while kill -0 "$install_pid" 2>/dev/null; do
-        if [ "$elapsed" -ge "$install_timeout" ]; then
-            kill_process_tree "$install_pid"
-            wait "$install_pid" 2>/dev/null || true
-            return 124
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-    wait "$install_pid"
 }
 
 # Quoted heredoc written to a mode-600 temporary file: this mirrors the
@@ -332,6 +296,95 @@ fi
 
 rm -f "$CLI_INSTALLER"
 CLI_INSTALLER=""
+
+# ============================================================================
+# Provision through the Corridor CLI
+# ============================================================================
+CORRIDOR_BIN="$CORRIDOR_CONFIG_DIR/bin/corridor"
+
+# version_at_least <version> <minimum>: numeric x.y.z compare. Anything that is
+# not plain digits (a dev build, a prerelease tag) fails, so it takes the
+# legacy path.
+version_at_least() {
+    local have want i
+    IFS=. read -r -a have <<< "$1"
+    IFS=. read -r -a want <<< "$2"
+    for i in 0 1 2; do
+        case "${have[$i]:-}" in ""|*[!0-9]*) return 1 ;; esac
+        [ "${have[$i]}" -gt "${want[$i]}" ] && return 0
+        [ "${have[$i]}" -lt "${want[$i]}" ] && return 1
+    done
+    return 0
+}
+
+CLI_VERSION=""
+if [ "$CLI_INSTALLED" = "true" ] && [ -x "$CORRIDOR_BIN" ]; then
+    CLI_VERSION=$(sudo -u "$CURRENT_USER" env HOME="$USER_HOME" "$CORRIDOR_BIN" --version 2>/dev/null \
+        | awk 'NR == 1 { print $NF }' || echo "")
+fi
+
+if version_at_least "$CLI_VERSION" "$CORRIDOR_MIN_PROVISION_VERSION"; then
+    log_info "Provisioning $CURRENT_USER with corridor $CLI_VERSION..."
+    # The team token goes on stdin to stay out of argv. launchctl asuser puts the
+    # editor CLIs in the user's GUI session, as running them from Terminal would.
+    if printf '%s\n' "$CORRIDOR_TEAM_TOKEN" \
+        | launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" env HOME="$USER_HOME" \
+            "$CORRIDOR_BIN" mdm provision \
+            --email "$USER_EMAIL" --serial "$DEVICE_SERIAL" --api-url "$CORRIDOR_API_URL"; then
+        exit 0
+    fi
+    log_error "corridor mdm provision failed. See its output above; the MDM will retry on a later check-in."
+    exit 1
+fi
+
+if [ "$CLI_INSTALLED" = "true" ]; then
+    log_info "Corridor CLI version '${CLI_VERSION:-unknown}' is older than $CORRIDOR_MIN_PROVISION_VERSION; using in-script provisioning."
+fi
+
+# ============================================================================
+# Legacy in-script provisioning
+# ============================================================================
+# Used when the installed CLI predates `corridor mdm provision`
+# (CORRIDOR_MIN_PROVISION_VERSION) or did not install. Remove once every
+# supported CLI release has the command.
+EXTENSION_INSTALL_TIMEOUT=60
+EXTENSION_PHASE_TIMEOUT=150
+
+kill_process_tree() {
+    local parent_pid="$1"
+    local child_pid
+    for child_pid in $(pgrep -P "$parent_pid" 2>/dev/null); do
+        kill_process_tree "$child_pid"
+    done
+    kill -TERM "$parent_pid" 2>/dev/null || true
+    kill -KILL "$parent_pid" 2>/dev/null || true
+}
+
+run_extension_install() {
+    EXTENSION_OUTPUT_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-extension.XXXXXX")
+    launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
+        env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
+        --install-extension corridor.Corridor --force \
+        > "$EXTENSION_OUTPUT_FILE" 2>&1 &
+    local install_pid=$!
+    local elapsed=0
+    local phase_remaining=$((EXTENSION_PHASE_TIMEOUT - (SECONDS - EXTENSION_PHASE_START)))
+    local install_timeout="$EXTENSION_INSTALL_TIMEOUT"
+    if [ "$phase_remaining" -lt "$install_timeout" ]; then
+        install_timeout="$phase_remaining"
+    fi
+    INSTALL_TIMEOUT_USED="$install_timeout"
+    while kill -0 "$install_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$install_timeout" ]; then
+            kill_process_tree "$install_pid"
+            wait "$install_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$install_pid"
+}
 
 # ============================================================================
 # Detect editors and install the Corridor extension

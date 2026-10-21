@@ -7,8 +7,8 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 LOG_PREFIX="[Corridor MDM]"
 CORRIDOR_API_URL="https://app.corridor.dev/api"
 CORRIDOR_CLI_INSTALL_URL="https://app.corridor.dev/cli/install.sh"
-EXTENSION_INSTALL_TIMEOUT=60
-EXTENSION_PHASE_TIMEOUT=150
+# First CLI release with `corridor mdm provision`. Older CLIs use the in-script path.
+CORRIDOR_MIN_PROVISION_VERSION="0.0.91"
 
 # The MDM agent may run from a directory the console user cannot read; use a stable
 # working directory so child processes do not emit getcwd errors.
@@ -74,40 +74,4 @@ is_safe_username() {
 # Team tokens use cor-…; minted API tokens use cor_… — both must be scrubbed.
 redact() {
     printf '%s' "$1" | tr -d '\n' | cut -c1-200 | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g'
-}
-
-kill_process_tree() {
-    local parent_pid="$1"
-    local child_pid
-    for child_pid in $(pgrep -P "$parent_pid" 2>/dev/null); do
-        kill_process_tree "$child_pid"
-    done
-    kill -TERM "$parent_pid" 2>/dev/null || true
-    kill -KILL "$parent_pid" 2>/dev/null || true
-}
-
-run_extension_install() {
-    EXTENSION_OUTPUT_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-extension.XXXXXX")
-    launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
-        env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
-        --install-extension corridor.Corridor --force \
-        > "$EXTENSION_OUTPUT_FILE" 2>&1 &
-    local install_pid=$!
-    local elapsed=0
-    local phase_remaining=$((EXTENSION_PHASE_TIMEOUT - (SECONDS - EXTENSION_PHASE_START)))
-    local install_timeout="$EXTENSION_INSTALL_TIMEOUT"
-    if [ "$phase_remaining" -lt "$install_timeout" ]; then
-        install_timeout="$phase_remaining"
-    fi
-    INSTALL_TIMEOUT_USED="$install_timeout"
-    while kill -0 "$install_pid" 2>/dev/null; do
-        if [ "$elapsed" -ge "$install_timeout" ]; then
-            kill_process_tree "$install_pid"
-            wait "$install_pid" 2>/dev/null || true
-            return 124
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-    wait "$install_pid"
 }

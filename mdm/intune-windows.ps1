@@ -55,6 +55,8 @@ $ErrorActionPreference = "Stop"
 $LOG_PREFIX = "[Corridor MDM]"
 $CORRIDOR_API_URL = "https://app.corridor.dev/api"
 $CLI_INSTALL_URL = "https://app.corridor.dev/cli/install.ps1"
+# First CLI release with `corridor mdm provision`. Older CLIs use the in-script path.
+$CORRIDOR_MIN_PROVISION_VERSION = "0.0.91"
 
 # Force TLS 1.2 (Windows PowerShell 5.1 defaults to TLS 1.0/1.1). Enable TLS 1.3
 # only when the runtime actually defines it — the [Net.SecurityProtocolType]::Tls13
@@ -172,6 +174,24 @@ function Set-UserOnlyAcl {
     if ($result.ExitCode -ne 0) {
         Write-Log "Could not tighten ACL on $Path (icacls exit $($result.ExitCode)). Continuing." -Level ERROR
     }
+}
+
+# Numeric x.y.z compare. Anything that is not plain digits (a dev build, a
+# prerelease tag) fails, so it takes the legacy path.
+function Test-VersionAtLeast {
+    param([string]$Version, [string]$Minimum)
+    if ($Version -notmatch '^\d+\.\d+\.\d+$') { return $false }
+    return ([version]$Version) -ge ([version]$Minimum)
+}
+
+# `corridor --version` prints "corridor version X.Y.Z".
+function Get-CorridorCliVersion {
+    param([string]$CliExe)
+    if (-not (Test-Path -LiteralPath $CliExe)) { return "" }
+    $result = Invoke-NativeCommand -FilePath $CliExe -Arguments @("--version")
+    if ($result.ExitCode -ne 0 -or -not $result.Output) { return "" }
+    $firstLine = ($result.Output -split "`r?`n")[0].Trim()
+    return ($firstLine -split '\s+')[-1]
 }
 
 function Get-DeviceSerial {
@@ -408,276 +428,310 @@ catch {
 }
 
 # ============================================================================
-# Detect installed editors
+# Provision through the Corridor CLI
 # ============================================================================
-# Each editor lists candidate (Exe, Cli) pairs covering per-user and machine-wide
-# installs; the first candidate whose Exe and Cli both exist is used.
-$Editors = @(
-    [pscustomobject]@{
-        Name       = "Cursor"
-        Platform   = "cursor"
-        ExtDir     = ".cursor\extensions"
-        Candidates = @(
-            @{ Exe = (Join-Path $UserProfilePath "AppData\Local\Programs\cursor\Cursor.exe"); Cli = (Join-Path $UserProfilePath "AppData\Local\Programs\cursor\resources\app\bin\cursor.cmd") },
-            @{ Exe = "C:\Program Files\cursor\Cursor.exe"; Cli = "C:\Program Files\cursor\resources\app\bin\cursor.cmd" }
-        )
-    },
-    [pscustomobject]@{
-        Name       = "VSCode"
-        Platform   = "vscode"
-        ExtDir     = ".vscode\extensions"
-        Candidates = @(
-            @{ Exe = (Join-Path $UserProfilePath "AppData\Local\Programs\Microsoft VS Code\Code.exe"); Cli = (Join-Path $UserProfilePath "AppData\Local\Programs\Microsoft VS Code\bin\code.cmd") },
-            @{ Exe = "C:\Program Files\Microsoft VS Code\Code.exe"; Cli = "C:\Program Files\Microsoft VS Code\bin\code.cmd" },
-            @{ Exe = "C:\Program Files (x86)\Microsoft VS Code\Code.exe"; Cli = "C:\Program Files (x86)\Microsoft VS Code\bin\code.cmd" }
-        )
-    },
-    [pscustomobject]@{
-        Name       = "Windsurf"
-        Platform   = "windsurf"
-        ExtDir     = ".windsurf\extensions"
-        Candidates = @(
-            @{ Exe = (Join-Path $UserProfilePath "AppData\Local\Programs\Windsurf\Windsurf.exe"); Cli = (Join-Path $UserProfilePath "AppData\Local\Programs\Windsurf\bin\windsurf.cmd") },
-            @{ Exe = "C:\Program Files\Windsurf\Windsurf.exe"; Cli = "C:\Program Files\Windsurf\bin\windsurf.cmd" }
-        )
+# This script already runs as the logged-on user, which `corridor mdm provision`
+# requires (it refuses LocalSystem). The team token goes on stdin to stay out of
+# argv. Intune stores serials with whitespace stripped, and the CLI rejects
+# whitespace, so pass the stripped form.
+$PlatformFailure = $false
+$CliVersion = if ($CliInstalled) { Get-CorridorCliVersion -CliExe $CorridorCliExe } else { "" }
+
+if (Test-VersionAtLeast -Version $CliVersion -Minimum $CORRIDOR_MIN_PROVISION_VERSION) {
+    Write-Log "Provisioning $CurrentUser with corridor $CliVersion..."
+    $provision = Invoke-NativeCommand -FilePath $CorridorCliExe -Arguments @(
+        "mdm", "provision",
+        "--email", $UserEmail,
+        "--serial", ($DeviceSerial -replace '\s', ''),
+        "--api-url", $CORRIDOR_API_URL
+    ) -InputText $CORRIDOR_TEAM_TOKEN
+    if ($provision.Output) {
+        Write-Log "corridor mdm provision output:`n$($provision.Output.TrimEnd())"
     }
-)
-
-$InstalledEditors = @()
-foreach ($editor in $Editors) {
-    $found = $null
-    foreach ($candidate in $editor.Candidates) {
-        if (Test-Path -LiteralPath $candidate.Exe) {
-            if (Test-Path -LiteralPath $candidate.Cli) {
-                $found = $candidate
-                break
-            }
-            else {
-                Write-Log "$($editor.Name) found at $($candidate.Exe) but CLI not available at $($candidate.Cli)" -Level ERROR
-            }
-        }
-    }
-
-    if ($found) {
-        Write-Log "$($editor.Name) detected at $($found.Exe)"
-        $InstalledEditors += [pscustomobject]@{
-            Name     = $editor.Name
-            Platform = $editor.Platform
-            ExtDir   = $editor.ExtDir
-            Exe      = $found.Exe
-            Cli      = $found.Cli
-        }
-    }
-}
-
-# Build the list of platforms to provision: each installed editor plus "cli" if
-# the Corridor CLI installed successfully.
-$ProvisionPlatforms = @()
-foreach ($editor in $InstalledEditors) {
-    $ProvisionPlatforms += $editor.Platform
-}
-if ($CliInstalled) {
-    $ProvisionPlatforms += "cli"
-}
-
-# Nothing to do if there are no editors and the CLI did not install.
-if ($InstalledEditors.Count -eq 0) {
-    Write-Log "No supported editors (Cursor, VS Code, Windsurf) are installed. Skipping Corridor extension installation."
-    if ($ProvisionPlatforms.Count -eq 0) {
-        Write-Log "Corridor CLI not installed and no editors found; nothing to provision."
-        exit 0
+    if ($provision.ExitCode -ne 0) {
+        Write-Log "corridor mdm provision failed (exit $($provision.ExitCode)). See its output above; Intune will retry on a later check-in." -Level ERROR
+        $PlatformFailure = $true
     }
 }
 else {
-    Write-Log "Found $($InstalledEditors.Count) installed editor(s): $(($InstalledEditors | ForEach-Object { $_.Name }) -join ', ')"
-}
+    if ($CliInstalled) {
+        Write-Log "Corridor CLI version '$CliVersion' is older than $CORRIDOR_MIN_PROVISION_VERSION; using in-script provisioning."
+    }
 
-# ============================================================================
-# Install the Corridor extension for each detected editor
-# ============================================================================
-# NODE_USE_SYSTEM_CA=1 adds the Windows certificate store to the editor's bundled
-# CA list, so installs work behind TLS-intercepting proxies (Zscaler, etc.).
-$env:NODE_USE_SYSTEM_CA = "1"
-foreach ($editor in $InstalledEditors) {
-    Write-Log "Installing Corridor extension for $($editor.Name)..."
-
-    $install = Invoke-NativeCommand -FilePath $editor.Cli -Arguments @(
-        "--install-extension", "corridor.Corridor", "--force"
+    # Legacy in-script provisioning. Remove once every supported CLI release
+    # has `corridor mdm provision`.
+    # ============================================================================
+    # Detect installed editors
+    # ============================================================================
+    # Each editor lists candidate (Exe, Cli) pairs covering per-user and machine-wide
+    # installs; the first candidate whose Exe and Cli both exist is used.
+    $Editors = @(
+        [pscustomobject]@{
+            Name       = "Cursor"
+            Platform   = "cursor"
+            ExtDir     = ".cursor\extensions"
+            Candidates = @(
+                @{ Exe = (Join-Path $UserProfilePath "AppData\Local\Programs\cursor\Cursor.exe"); Cli = (Join-Path $UserProfilePath "AppData\Local\Programs\cursor\resources\app\bin\cursor.cmd") },
+                @{ Exe = "C:\Program Files\cursor\Cursor.exe"; Cli = "C:\Program Files\cursor\resources\app\bin\cursor.cmd" }
+            )
+        },
+        [pscustomobject]@{
+            Name       = "VSCode"
+            Platform   = "vscode"
+            ExtDir     = ".vscode\extensions"
+            Candidates = @(
+                @{ Exe = (Join-Path $UserProfilePath "AppData\Local\Programs\Microsoft VS Code\Code.exe"); Cli = (Join-Path $UserProfilePath "AppData\Local\Programs\Microsoft VS Code\bin\code.cmd") },
+                @{ Exe = "C:\Program Files\Microsoft VS Code\Code.exe"; Cli = "C:\Program Files\Microsoft VS Code\bin\code.cmd" },
+                @{ Exe = "C:\Program Files (x86)\Microsoft VS Code\Code.exe"; Cli = "C:\Program Files (x86)\Microsoft VS Code\bin\code.cmd" }
+            )
+        },
+        [pscustomobject]@{
+            Name       = "Windsurf"
+            Platform   = "windsurf"
+            ExtDir     = ".windsurf\extensions"
+            Candidates = @(
+                @{ Exe = (Join-Path $UserProfilePath "AppData\Local\Programs\Windsurf\Windsurf.exe"); Cli = (Join-Path $UserProfilePath "AppData\Local\Programs\Windsurf\bin\windsurf.cmd") },
+                @{ Exe = "C:\Program Files\Windsurf\Windsurf.exe"; Cli = "C:\Program Files\Windsurf\bin\windsurf.cmd" }
+            )
+        }
     )
-    $output = $install.Output
 
-    if ($output -match "(?i)already installed") {
-        Write-Log "Corridor extension is already installed for $($editor.Name)"
-    }
-    elseif ($install.ExitCode -eq 0) {
-        Write-Log "Corridor extension installed successfully for $($editor.Name)" -Level SUCCESS
-    }
-    else {
-        # Fallback: the install command failed; check the extensions directory.
-        $extDir = Join-Path $UserProfilePath $editor.ExtDir
-        $extInstalled = $false
-        if (Test-Path -LiteralPath $extDir) {
-            $corridorExt = Get-ChildItem -LiteralPath $extDir -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match "(?i)corridor" }
-            if ($corridorExt) {
-                $extInstalled = $true
+    $InstalledEditors = @()
+    foreach ($editor in $Editors) {
+        $found = $null
+        foreach ($candidate in $editor.Candidates) {
+            if (Test-Path -LiteralPath $candidate.Exe) {
+                if (Test-Path -LiteralPath $candidate.Cli) {
+                    $found = $candidate
+                    break
+                }
+                else {
+                    Write-Log "$($editor.Name) found at $($candidate.Exe) but CLI not available at $($candidate.Cli)" -Level ERROR
+                }
             }
         }
 
-        if ($extInstalled) {
+        if ($found) {
+            Write-Log "$($editor.Name) detected at $($found.Exe)"
+            $InstalledEditors += [pscustomobject]@{
+                Name     = $editor.Name
+                Platform = $editor.Platform
+                ExtDir   = $editor.ExtDir
+                Exe      = $found.Exe
+                Cli      = $found.Cli
+            }
+        }
+    }
+
+    # Build the list of platforms to provision: each installed editor plus "cli" if
+    # the Corridor CLI installed successfully.
+    $ProvisionPlatforms = @()
+    foreach ($editor in $InstalledEditors) {
+        $ProvisionPlatforms += $editor.Platform
+    }
+    if ($CliInstalled) {
+        $ProvisionPlatforms += "cli"
+    }
+
+    # Nothing to do if there are no editors and the CLI did not install.
+    if ($InstalledEditors.Count -eq 0) {
+        Write-Log "No supported editors (Cursor, VS Code, Windsurf) are installed. Skipping Corridor extension installation."
+        if ($ProvisionPlatforms.Count -eq 0) {
+            Write-Log "Corridor CLI not installed and no editors found; nothing to provision."
+            exit 0
+        }
+    }
+    else {
+        Write-Log "Found $($InstalledEditors.Count) installed editor(s): $(($InstalledEditors | ForEach-Object { $_.Name }) -join ', ')"
+    }
+
+    # ============================================================================
+    # Install the Corridor extension for each detected editor
+    # ============================================================================
+    # NODE_USE_SYSTEM_CA=1 adds the Windows certificate store to the editor's bundled
+    # CA list, so installs work behind TLS-intercepting proxies (Zscaler, etc.).
+    $env:NODE_USE_SYSTEM_CA = "1"
+    foreach ($editor in $InstalledEditors) {
+        Write-Log "Installing Corridor extension for $($editor.Name)..."
+
+        $install = Invoke-NativeCommand -FilePath $editor.Cli -Arguments @(
+            "--install-extension", "corridor.Corridor", "--force"
+        )
+        $output = $install.Output
+
+        if ($output -match "(?i)already installed") {
             Write-Log "Corridor extension is already installed for $($editor.Name)"
         }
+        elseif ($install.ExitCode -eq 0) {
+            Write-Log "Corridor extension installed successfully for $($editor.Name)" -Level SUCCESS
+        }
         else {
-            Write-Log "Failed to install Corridor extension for $($editor.Name) (exit $($install.ExitCode)): $(Format-Redacted $output)" -Level ERROR
+            # Fallback: the install command failed; check the extensions directory.
+            $extDir = Join-Path $UserProfilePath $editor.ExtDir
+            $extInstalled = $false
+            if (Test-Path -LiteralPath $extDir) {
+                $corridorExt = Get-ChildItem -LiteralPath $extDir -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "(?i)corridor" }
+                if ($corridorExt) {
+                    $extInstalled = $true
+                }
+            }
+
+            if ($extInstalled) {
+                Write-Log "Corridor extension is already installed for $($editor.Name)"
+            }
+            else {
+                Write-Log "Failed to install Corridor extension for $($editor.Name) (exit $($install.ExitCode)): $(Format-Redacted $output)" -Level ERROR
+                exit 1
+            }
+        }
+    }
+
+    # ============================================================================
+    # Provision user and create a separate API token for each platform
+    # ============================================================================
+    Write-Log "Provisioning user with Corridor..."
+    $mdmSyncUri = "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"
+    $PlatformFailure = $false
+
+    foreach ($platform in $ProvisionPlatforms) {
+        Write-Log "Creating API token for $platform..."
+
+        $body = @{
+            deviceSerial = $DeviceSerial
+            userEmail    = $UserEmail
+            platform     = $platform
+        } | ConvertTo-Json -Compress
+
+        # Write the body to a temp file and POST it with curl --data-binary. This
+        # sidesteps Windows curl JSON-escaping issues, and Invoke-RestMethod's habit
+        # of downgrading to GET on some 5.1 builds.
+        $bodyFile = Join-Path $env:TEMP "corridor-mdm-body.json"
+        Set-Content -Path $bodyFile -Encoding ascii -NoNewline -Value $body
+
+        # The Authorization header goes through a curl config on stdin to keep the
+        # team-wide token out of argv. No --retry: this call mints a token, so a
+        # retried POST would leave extra live credentials behind.
+        $curlArgs = @(
+            "-s",
+            "-S",
+            "--config", "-",
+            "--proto", "=https",
+            "--tlsv1.2",
+            "--connect-timeout", "15",
+            "--max-time", "60",
+            "-w", "`n%{http_code}",
+            "-X", "POST",
+            "-H", "Content-Type: application/json",
+            "--data-binary", "@$bodyFile",
+            $mdmSyncUri
+        )
+        $curl = Invoke-NativeCommand -FilePath "curl.exe" -Arguments $curlArgs `
+            -InputText "header = `"Authorization: Bearer $CORRIDOR_TEAM_TOKEN`""
+
+        Remove-Item -Path $bodyFile -Force -ErrorAction SilentlyContinue
+
+        if ($curl.ExitCode -ne 0) {
+            Write-Log "Failed to connect to Corridor API for $platform (curl exit code: $($curl.ExitCode))" -Level ERROR
             exit 1
         }
-    }
-}
 
-# ============================================================================
-# Provision user and create a separate API token for each platform
-# ============================================================================
-Write-Log "Provisioning user with Corridor..."
-$mdmSyncUri = "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"
-$PlatformFailure = $false
-
-foreach ($platform in $ProvisionPlatforms) {
-    Write-Log "Creating API token for $platform..."
-
-    $body = @{
-        deviceSerial = $DeviceSerial
-        userEmail    = $UserEmail
-        platform     = $platform
-    } | ConvertTo-Json -Compress
-
-    # Write the body to a temp file and POST it with curl --data-binary. This
-    # sidesteps Windows curl JSON-escaping issues, and Invoke-RestMethod's habit
-    # of downgrading to GET on some 5.1 builds.
-    $bodyFile = Join-Path $env:TEMP "corridor-mdm-body.json"
-    Set-Content -Path $bodyFile -Encoding ascii -NoNewline -Value $body
-
-    # The Authorization header goes through a curl config on stdin to keep the
-    # team-wide token out of argv. No --retry: this call mints a token, so a
-    # retried POST would leave extra live credentials behind.
-    $curlArgs = @(
-        "-s",
-        "-S",
-        "--config", "-",
-        "--proto", "=https",
-        "--tlsv1.2",
-        "--connect-timeout", "15",
-        "--max-time", "60",
-        "-w", "`n%{http_code}",
-        "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "--data-binary", "@$bodyFile",
-        $mdmSyncUri
-    )
-    $curl = Invoke-NativeCommand -FilePath "curl.exe" -Arguments $curlArgs `
-        -InputText "header = `"Authorization: Bearer $CORRIDOR_TEAM_TOKEN`""
-
-    Remove-Item -Path $bodyFile -Force -ErrorAction SilentlyContinue
-
-    if ($curl.ExitCode -ne 0) {
-        Write-Log "Failed to connect to Corridor API for $platform (curl exit code: $($curl.ExitCode))" -Level ERROR
-        exit 1
-    }
-
-    # Split the trailing status code (curl -w "`n%{http_code}") from the body.
-    $trimmed = $curl.Output.TrimEnd("`r", "`n")
-    $newlineIndex = $trimmed.LastIndexOf("`n")
-    if ($newlineIndex -ge 0) {
-        $httpCode = $trimmed.Substring($newlineIndex + 1).Trim()
-        $responseBody = $trimmed.Substring(0, $newlineIndex)
-    }
-    else {
-        $httpCode = $trimmed.Trim()
-        $responseBody = ""
-    }
-
-    if ($httpCode -ne "200") {
-        Write-Log "Failed to provision token for $platform. HTTP $httpCode" -Level ERROR
-        Write-Log "Response body: $(Format-Redacted $responseBody)" -Level ERROR
-        $PlatformFailure = $true
-        continue
-    }
-
-    try {
-        $response = $responseBody | ConvertFrom-Json
-    }
-    catch {
-        Write-Log "Could not parse Corridor API response for $platform" -Level ERROR
-        exit 1
-    }
-
-    $apiToken = $response.apiToken
-    $apiTokenId = $response.apiTokenId
-
-    if ([string]::IsNullOrEmpty($apiToken)) {
-        Write-Log "Could not extract API token from response for $platform" -Level ERROR
-        exit 1
-    }
-
-    # Each platform gets its own subdirectory: .corridor/cursor, .corridor/vscode,
-    # .corridor/windsurf, .corridor/cli. The IDE extensions and CLI read
-    # %USERPROFILE%\.corridor\<platform>\pending-token.
-    $platformConfigDir = Join-Path $CorridorConfigDir $platform
-    $pendingTokenFile = Join-Path $platformConfigDir "pending-token"
-
-    if (-not (Test-Path -LiteralPath $platformConfigDir)) {
-        New-Item -ItemType Directory -Path $platformConfigDir -Force | Out-Null
-    }
-
-    # Tighten the directory ACL before writing the token so the file is born
-    # restricted (Windows analogue of macOS umask 077 / chmod 700).
-    Set-UserOnlyAcl -Path $platformConfigDir -Identity $LoggedInUser -Container
-
-    $tokenData = @{
-        apiToken      = $apiToken
-        apiTokenId    = $apiTokenId
-        provisionedAt = (Get-Date -Format "o")
-    } | ConvertTo-Json
-
-    Set-Content -Path $pendingTokenFile -Encoding ascii -Value $tokenData -Force
-
-    # Belt-and-suspenders: restrict the token file itself too (chmod 600).
-    Set-UserOnlyAcl -Path $pendingTokenFile -Identity $LoggedInUser
-
-    Write-Log "Pending token for $platform stored in $pendingTokenFile" -Level SUCCESS
-}
-
-if ($PlatformFailure) {
-    Write-Log "One or more platform token provisions failed; successful platforms were processed." -Level ERROR
-}
-else {
-    Write-Log "User provisioned successfully!" -Level SUCCESS
-}
-Write-Log "The Corridor extension will migrate tokens for each editor to secure storage on next launch of that editor"
-
-# ============================================================================
-# Install agent plugins (Claude Code, Factory Droid, Codex)
-# ============================================================================
-# With the CLI installed and its "cli" token provisioned above, configure the
-# agent plugins. `corridor install --yes` migrates the pending CLI token into the
-# user's config at startup, authenticates from it non-interactively, and detects
-# which agent CLIs (claude, droid, codex) are present in PATH. A missing agent CLI
-# or incomplete plugin setup is non-fatal, matching macOS.
-if ($CliInstalled) {
-    Write-Log "Setting up Corridor agent plugins (Claude Code, etc.) for $CurrentUser..."
-    if (Test-Path -LiteralPath $CorridorCliExe) {
-        $pluginResult = Invoke-NativeCommand -FilePath $CorridorCliExe -Arguments @("install", "--yes")
-        if ($pluginResult.Output) {
-            Write-Log "corridor install output:`n$($pluginResult.Output.TrimEnd())"
-        }
-        if ($pluginResult.ExitCode -eq 0) {
-            Write-Log "Corridor agent plugins installed" -Level SUCCESS
+        # Split the trailing status code (curl -w "`n%{http_code}") from the body.
+        $trimmed = $curl.Output.TrimEnd("`r", "`n")
+        $newlineIndex = $trimmed.LastIndexOf("`n")
+        if ($newlineIndex -ge 0) {
+            $httpCode = $trimmed.Substring($newlineIndex + 1).Trim()
+            $responseBody = $trimmed.Substring(0, $newlineIndex)
         }
         else {
-            Write-Log "Corridor agent plugin setup skipped or incomplete (non-fatal, e.g. no claude/droid/codex in PATH, or install did not finish; exit $($pluginResult.ExitCode)). See corridor output above for the cause." -Level ERROR
+            $httpCode = $trimmed.Trim()
+            $responseBody = ""
         }
+
+        if ($httpCode -ne "200") {
+            Write-Log "Failed to provision token for $platform. HTTP $httpCode" -Level ERROR
+            Write-Log "Response body: $(Format-Redacted $responseBody)" -Level ERROR
+            $PlatformFailure = $true
+            continue
+        }
+
+        try {
+            $response = $responseBody | ConvertFrom-Json
+        }
+        catch {
+            Write-Log "Could not parse Corridor API response for $platform" -Level ERROR
+            exit 1
+        }
+
+        $apiToken = $response.apiToken
+        $apiTokenId = $response.apiTokenId
+
+        if ([string]::IsNullOrEmpty($apiToken)) {
+            Write-Log "Could not extract API token from response for $platform" -Level ERROR
+            exit 1
+        }
+
+        # Each platform gets its own subdirectory: .corridor/cursor, .corridor/vscode,
+        # .corridor/windsurf, .corridor/cli. The IDE extensions and CLI read
+        # %USERPROFILE%\.corridor\<platform>\pending-token.
+        $platformConfigDir = Join-Path $CorridorConfigDir $platform
+        $pendingTokenFile = Join-Path $platformConfigDir "pending-token"
+
+        if (-not (Test-Path -LiteralPath $platformConfigDir)) {
+            New-Item -ItemType Directory -Path $platformConfigDir -Force | Out-Null
+        }
+
+        # Tighten the directory ACL before writing the token so the file is born
+        # restricted (Windows analogue of macOS umask 077 / chmod 700).
+        Set-UserOnlyAcl -Path $platformConfigDir -Identity $LoggedInUser -Container
+
+        $tokenData = @{
+            apiToken      = $apiToken
+            apiTokenId    = $apiTokenId
+            provisionedAt = (Get-Date -Format "o")
+        } | ConvertTo-Json
+
+        Set-Content -Path $pendingTokenFile -Encoding ascii -Value $tokenData -Force
+
+        # Belt-and-suspenders: restrict the token file itself too (chmod 600).
+        Set-UserOnlyAcl -Path $pendingTokenFile -Identity $LoggedInUser
+
+        Write-Log "Pending token for $platform stored in $pendingTokenFile" -Level SUCCESS
+    }
+
+    if ($PlatformFailure) {
+        Write-Log "One or more platform token provisions failed; successful platforms were processed." -Level ERROR
     }
     else {
-        Write-Log "Corridor CLI not found at $CorridorCliExe; skipping agent plugin setup (non-fatal)." -Level ERROR
+        Write-Log "User provisioned successfully!" -Level SUCCESS
+    }
+    Write-Log "The Corridor extension will migrate tokens for each editor to secure storage on next launch of that editor"
+
+    # ============================================================================
+    # Install agent plugins (Claude Code, Factory Droid, Codex)
+    # ============================================================================
+    # With the CLI installed and its "cli" token provisioned above, configure the
+    # agent plugins. `corridor install --yes` migrates the pending CLI token into the
+    # user's config at startup, authenticates from it non-interactively, and detects
+    # which agent CLIs (claude, droid, codex) are present in PATH. A missing agent CLI
+    # or incomplete plugin setup is non-fatal, matching macOS.
+    if ($CliInstalled) {
+        Write-Log "Setting up Corridor agent plugins (Claude Code, etc.) for $CurrentUser..."
+        if (Test-Path -LiteralPath $CorridorCliExe) {
+            $pluginResult = Invoke-NativeCommand -FilePath $CorridorCliExe -Arguments @("install", "--yes")
+            if ($pluginResult.Output) {
+                Write-Log "corridor install output:`n$($pluginResult.Output.TrimEnd())"
+            }
+            if ($pluginResult.ExitCode -eq 0) {
+                Write-Log "Corridor agent plugins installed" -Level SUCCESS
+            }
+            else {
+                Write-Log "Corridor agent plugin setup skipped or incomplete (non-fatal, e.g. no claude/droid/codex in PATH, or install did not finish; exit $($pluginResult.ExitCode)). See corridor output above for the cause." -Level ERROR
+            }
+        }
+        else {
+            Write-Log "Corridor CLI not found at $CorridorCliExe; skipping agent plugin setup (non-fatal)." -Level ERROR
+        }
     }
 }
 
@@ -686,10 +740,10 @@ if ($CliInstalled) {
 # ============================================================================
 # Developers often run their coding agents (claude/codex/droid) *inside* a WSL
 # distro, whose Linux $HOME is separate from %USERPROFILE% -- so none of the
-# Windows provisioning above reaches it. For each installed distro we replicate
-# the Linux flow: install the Linux Corridor CLI, provision a "cli" token, write
-# the pending-token, and run `corridor install --yes`. Per-distro failures are
-# non-fatal (logged, loop continues), matching the macOS CLI step.
+# Windows provisioning above reaches it. For each installed distro we install
+# the Linux Corridor CLI and run `corridor mdm provision`, or the older in-script
+# flow when the CLI predates it. Per-distro failures are non-fatal (logged, loop
+# continues), matching the macOS CLI step.
 $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
 if ($wsl) {
     # wsl -l -q emits UTF-16LE; decode and drop blank/docker-desktop entries.
@@ -714,6 +768,7 @@ set -eu
 [ -n "${COR_EMAIL:-}" ]  || { echo "COR_EMAIL not forwarded into WSL"; exit 3; }
 [ -n "${COR_SERIAL:-}" ] || { echo "COR_SERIAL not forwarded into WSL"; exit 3; }
 [ -n "${COR_API:-}" ]    || { echo "COR_API not forwarded into WSL"; exit 3; }
+[ -n "${COR_MIN_VERSION:-}" ] || { echo "COR_MIN_VERSION not forwarded into WSL"; exit 3; }
 
 # Agent CLIs (claude/codex/droid) and corridor live in ~/.local/bin. This shell is
 # non-login/non-interactive, so it never sourced ~/.bashrc -- put the dir on PATH
@@ -726,18 +781,51 @@ if command -v apt-get >/dev/null 2>&1; then
     apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || true
 fi
 
-# 1. Install the Linux Corridor CLI (auto-detects arm64/amd64). CI=1 keeps it
+umask 077
+installer="$(mktemp)"
+resp_file="$(mktemp)"
+trap 'rm -f "$installer" "$resp_file"' EXIT
+
+# 1. Install the Linux Corridor CLI (auto-detects arm64/amd64). Downloaded to a
+#    file first so a truncated download cannot partly run. CI=1 keeps it
 #    non-interactive; CORRIDOR_MDM=1 updates ~/.bashrc and defers plugin setup.
-curl -fsSL https://app.corridor.dev/cli/install.sh | CI=1 CORRIDOR_MDM=1 bash
+curl -fsSL --proto '=https' --tlsv1.2 -o "$installer" https://app.corridor.dev/cli/install.sh
+CI=1 CORRIDOR_MDM=1 bash "$installer"
 CORRIDOR_BIN="$HOME/.corridor/bin/corridor"
 [ -x "$CORRIDOR_BIN" ] || { echo "Corridor CLI missing after install at $CORRIDOR_BIN"; exit 4; }
 
-# 2. Provision a CLI token. Capture status + body so a non-200 fails loudly
+# Numeric x.y.z compare; a dev build or prerelease tag takes the legacy path.
+version_at_least() {
+    local have want i
+    IFS=. read -r -a have <<< "$1"
+    IFS=. read -r -a want <<< "$2"
+    for i in 0 1 2; do
+        case "${have[$i]:-}" in ""|*[!0-9]*) return 1 ;; esac
+        [ "${have[$i]}" -gt "${want[$i]}" ] && return 0
+        [ "${have[$i]}" -lt "${want[$i]}" ] && return 1
+    done
+    return 0
+}
+
+# 2. Provision through the CLI. It refuses to run as root, so a distro whose
+#    default user is root keeps the legacy path. The token goes on the CLI's own
+#    stdin (the pipe), not the stdin bash is reading this script from. The CLI
+#    rejects whitespace in serials, and Intune stores them stripped.
+cli_version=$("$CORRIDOR_BIN" --version 2>/dev/null | awk 'NR == 1 { print $NF }' || true)
+if [ "$(id -u)" != "0" ] && version_at_least "$cli_version" "$COR_MIN_VERSION"; then
+    printf '%s\n' "$COR_TOKEN" | "$CORRIDOR_BIN" mdm provision \
+        --email "$COR_EMAIL" --serial "$(printf '%s' "$COR_SERIAL" | tr -d '[:space:]')" \
+        --api-url "$COR_API"
+    echo "Corridor WSL provisioning complete for $(whoami)"
+    exit 0
+fi
+echo "Using in-script provisioning (corridor ${cli_version:-unknown}, uid $(id -u))"
+
+# Legacy in-script provisioning. Remove once every supported CLI release has
+# `corridor mdm provision` and root distros are handled.
+# 3. Provision a CLI token. Capture status + body so a non-200 fails loudly
 #    (a non-200 body is an error message and never contains a token).
 mkdir -p "$HOME/.corridor/cli"; chmod 700 "$HOME/.corridor" "$HOME/.corridor/cli"
-umask 077
-resp_file="$(mktemp)"
-trap 'rm -f "$resp_file"' EXIT
 body=$(printf '{"deviceSerial":"%s","userEmail":"%s","platform":"cli"}' "$COR_SERIAL" "$COR_EMAIL")
 # The token reaches curl as a config on its own stdin (the pipe), keeping it out
 # of argv; this does not touch the stdin bash is reading this script from.
@@ -752,7 +840,7 @@ if [ "$http" != "200" ]; then
     exit 5
 fi
 
-# 3. Write the pending-token. Read the response file BY PATH (argv), not stdin, so
+# 4. Write the pending-token. Read the response file BY PATH (argv), not stdin, so
 #    there is no clash with how this script itself is fed to bash. python3 preferred;
 #    grep fallback validates the cor_ prefix. chmod 600 == the icacls grant on Windows.
 pending="$HOME/.corridor/cli/pending-token"
@@ -773,7 +861,7 @@ else
 fi
 chmod 600 "$pending"
 
-# 4. Migrate the token + set up agent plugins (claude/codex/droid if in PATH). Non-fatal.
+# 5. Migrate the token + set up agent plugins (claude/codex/droid if in PATH). Non-fatal.
 "$CORRIDOR_BIN" install --yes || echo "corridor install incomplete (non-fatal)"
 echo "Corridor WSL provisioning complete for $(whoami)"
 '@
@@ -793,7 +881,8 @@ echo "Corridor WSL provisioning complete for $(whoami)"
         $env:COR_SERIAL = $DeviceSerial
         $env:COR_EMAIL = $UserEmail
         $env:COR_API = $CORRIDOR_API_URL
-        $env:WSLENV = "COR_TOKEN/u:COR_SERIAL/u:COR_EMAIL/u:COR_API/u"
+        $env:COR_MIN_VERSION = $CORRIDOR_MIN_PROVISION_VERSION
+        $env:WSLENV = "COR_TOKEN/u:COR_SERIAL/u:COR_EMAIL/u:COR_API/u:COR_MIN_VERSION/u"
         try {
             # Run via Invoke-NativeCommand (array args, relaxed ErrorActionPreference)
             # so stderr from inside the distro cannot raise a terminating
@@ -815,7 +904,7 @@ echo "Corridor WSL provisioning complete for $(whoami)"
             }
         }
         finally {
-            Remove-Item Env:\COR_TOKEN, Env:\COR_SERIAL, Env:\COR_EMAIL, Env:\COR_API, Env:\WSLENV -ErrorAction SilentlyContinue
+            Remove-Item Env:\COR_TOKEN, Env:\COR_SERIAL, Env:\COR_EMAIL, Env:\COR_API, Env:\COR_MIN_VERSION, Env:\WSLENV -ErrorAction SilentlyContinue
         }
     }
 }
