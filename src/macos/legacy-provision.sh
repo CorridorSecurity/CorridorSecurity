@@ -227,46 +227,9 @@ PLATFORM_FAILURE=0
 for PLATFORM in $PROVISION_PLATFORMS; do
     PLATFORM_CONFIG_DIR="$CORRIDOR_CONFIG_DIR/$PLATFORM"
 
-    log_info "Creating API token for $PLATFORM..."
-
-    REQUEST_BODY=$(printf '{"deviceSerial": "%s", "userEmail": "%s", "platform": "%s"}' \
-        "$DEVICE_SERIAL" "$USER_EMAIL" "$PLATFORM")
-
-    # Token goes through a config file on stdin to keep this team-wide credential
-    # out of argv. No --retry: this call mints a token, so a retried POST would
-    # leave extra live credentials behind.
-    if ! RESPONSE=$(printf 'header = "Authorization: Bearer %s"\n' "$CORRIDOR_TEAM_TOKEN" \
-        | curl -s --config - \
-            --proto '=https' --tlsv1.2 \
-            --connect-timeout 15 --max-time 60 \
-            -w "\n%{http_code}" \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -d "$REQUEST_BODY" \
-            "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"); then
-        log_error "Could not reach $CORRIDOR_API_URL to provision $PLATFORM"
-        exit 1
-    fi
-
-    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-    BODY=$(echo "$RESPONSE" | sed '$d')
-
-    if [ "$HTTP_CODE" != "200" ]; then
-        log_warn "Failed to provision token for $PLATFORM. HTTP $HTTP_CODE: $(redact "$BODY")"
+    if ! mint_platform_token "$PLATFORM"; then
         PLATFORM_FAILURE=1
         continue
-    fi
-
-    API_TOKEN=$(printf '%s' "$BODY" | sed -n 's/.*"apiToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    API_TOKEN_ID=$(printf '%s' "$BODY" | sed -n 's/.*"apiTokenId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-
-    if [ -z "$API_TOKEN" ]; then
-        log_error "Could not extract API token from response for $PLATFORM"
-        exit 1
-    fi
-    if ! is_safe_value "$API_TOKEN" || ! is_safe_value "$API_TOKEN_ID"; then
-        log_error "API token response for $PLATFORM contains unexpected characters. Refusing to store it."
-        exit 1
     fi
 
     TOKEN_JSON=$(printf '{\n  "apiToken": "%s",\n  "apiTokenId": "%s",\n  "provisionedAt": "%s"\n}\n' \

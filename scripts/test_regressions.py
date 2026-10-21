@@ -11,6 +11,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BASH = "/bin/bash"
 GENERATED = tuple(f"mdm/{mdm}-macos.sh" for mdm in ("kandji", "jamf", "fleet", "intune"))
 
 INSTALL_FIXTURE = r'''
@@ -60,9 +61,50 @@ DEVICE_SERIAL=REVIEW01
 USER_EMAIL=review@example.test
 '''
 
+# Stubs on top of INSTALL_FIXTURE for the version-gated CLI path in common.sh.
+CLI_PATH_FIXTURE = INSTALL_FIXTURE + r'''
+launchctl() {
+    [ "$1" = asuser ] || return 99
+    shift 2
+    "$@"
+}
+curl() {
+    cat > "$REVIEW_CASE/curl-stdin"
+    while [ $# -gt 0 ]; do
+        [ "$1" = -d ] && printf '%s\n' "$2" >> "$REVIEW_CASE/curl-bodies"
+        shift
+    done
+    printf '{"apiToken":"cor_review_fixture","apiTokenId":"review-fixture"}\n200\n'
+}
+CURRENT_USER_UID=501
+CORRIDOR_CONFIG_DIR="$REVIEW_CASE/home/.corridor"
+CORRIDOR_MIN_PROVISION_VERSION=0.0.91
+CLI_INSTALLED=true
+'''
+
+FAKE_CORRIDOR = r'''#!/bin/sh
+case "$1 $2" in
+    "--version ")
+        echo "corridor version 0.0.99"
+        ;;
+    "mdm platforms")
+        printf 'cursor\nbogus\ncli\ncli\n'
+        ;;
+    "mdm provision")
+        printf '%s\n' "$@" > "$REVIEW_CASE/provision-argv"
+        env > "$REVIEW_CASE/provision-env"
+        cat > "$REVIEW_CASE/provision-stdin"
+        ;;
+    *)
+        exit 64
+        ;;
+esac
+'''
+
 
 class ExtensionRetryTests(unittest.TestCase):
     def test_install_outcomes_preserve_token_provisioning(self):
+        mint = (ROOT / "src/macos/mint-token.sh").read_text()
         common = (ROOT / "src/macos/legacy-provision.sh").read_text()
         section = common[common.index("skip_remaining_editors() {"):]
         cases = (
@@ -76,7 +118,7 @@ class ExtensionRetryTests(unittest.TestCase):
                 (case / "editor").touch()
                 env = dict(os.environ, REVIEW_CASE=temp, REVIEW_SCENARIO=scenario)
                 result = subprocess.run(
-                    ["bash", "-c", INSTALL_FIXTURE + section],
+                    [BASH, "-c", INSTALL_FIXTURE + mint + section],
                     cwd=case, env=env, text=True, capture_output=True,
                 )
                 self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
@@ -84,6 +126,52 @@ class ExtensionRetryTests(unittest.TestCase):
                 for platform in ("cursor", "vscode"):
                     pending = case / "home/.corridor" / platform / "pending-token"
                     self.assertEqual(json.loads(pending.read_text())["apiToken"], "cor_review_fixture")
+
+
+class CliProvisionTests(unittest.TestCase):
+    def test_cli_gets_only_per_user_tokens(self):
+        mint = (ROOT / "src/macos/mint-token.sh").read_text()
+        common = (ROOT / "src/macos/common.sh").read_text()
+        section = common[
+            common.index("# Provision through the Corridor CLI"):
+            common.index("# @include legacy-provision.sh")
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            case = Path(temp)
+            corridor = case / "home/.corridor/bin/corridor"
+            corridor.parent.mkdir(parents=True)
+            corridor.write_text(FAKE_CORRIDOR)
+            corridor.chmod(0o755)
+            env = dict(os.environ, REVIEW_CASE=temp)
+            result = subprocess.run(
+                [BASH, "-c", CLI_PATH_FIXTURE + mint + section],
+                cwd=case, env=env, text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            lines = [
+                json.dumps({"platform": platform, "apiToken": "cor_review_fixture",
+                            "apiTokenId": "review-fixture"}, separators=(",", ":"))
+                for platform in ("cursor", "cli")
+            ]
+            self.assertEqual((case / "provision-stdin").read_text(), "\n".join(lines) + "\n")
+            self.assertEqual(
+                (case / "provision-argv").read_text().splitlines(),
+                ["mdm", "provision", "--email", "review@example.test", "--serial", "REVIEW01",
+                 "--api-url", "https://invalid.example.test/api"],
+            )
+
+            bodies = (case / "curl-bodies").read_text()
+            self.assertEqual(bodies.count("deviceSerial"), 2)
+            self.assertIn('"platform": "cursor"', bodies)
+            self.assertIn('"platform": "cli"', bodies)
+            self.assertNotIn("bogus", bodies)
+            self.assertIn("bogus", result.stdout)
+
+            # The curl config on stdin carries the team token, so this check can fail.
+            self.assertIn("cor-team_review_fixture", (case / "curl-stdin").read_text())
+            for name in ("provision-argv", "provision-env", "provision-stdin"):
+                self.assertNotIn("cor-team_review_fixture", (case / name).read_text(), name)
 
 
 class PreCommitTests(unittest.TestCase):

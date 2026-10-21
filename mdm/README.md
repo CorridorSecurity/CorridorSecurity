@@ -15,13 +15,20 @@ The scripts also download and install the Corridor CLI for the logged-in user, p
 
 ## How the scripts split the work with the CLI
 
-The scripts do the parts that need MDM context: they read the user's email and the device serial, find the signed-in user, and download and verify the Corridor CLI as that user. They then hand the rest to the CLI:
+The scripts do the parts that need MDM context: they read the user's email and the device serial, find the signed-in user, and download and verify the Corridor CLI as that user. They also keep the team token. They use it to mint one API token per platform for this user. The CLI then does the rest with those tokens:
 
 ```bash
+corridor mdm platforms
 corridor mdm provision --email <email> --serial <serial> --api-url <url>
 ```
 
-It runs as the signed-in user, never as root or LocalSystem. The team token goes on its stdin, never in argv. The command detects editors, installs the extension, mints one token per platform, writes the pending tokens, and runs `corridor install --yes`. It exits 1 on any failure, so the MDM records a failure and retries.
+Both commands run as the signed-in user, never as root or LocalSystem. `corridor mdm platforms` prints the platforms to provision, one per line: `cursor`, `vscode`, `windsurf` and `cli`. The script mints a token for each one. It sends the tokens to `corridor mdm provision` on stdin, one JSON object per line, so they stay out of argv:
+
+```json
+{"platform":"cursor","apiToken":"cor_...","apiTokenId":"..."}
+```
+
+The CLI never receives the team token. The user owns the CLI binary and could swap it, and the team token mints tokens for any email on the team. On macOS the script mints the tokens as root, so the team token never reaches a process the user controls. The Windows script and the WSL step already run as the user, so they use the same flow. The CLI still never sees the team token there. The CLI installs the extensions, writes each pending token, and runs `corridor install --yes` when it got a `cli` token. It exits 1 on any failure, so the MDM records a failure and retries.
 
 Each script keeps its older in-script path as a fallback. It runs when the installed CLI is older than `CORRIDOR_MIN_PROVISION_VERSION` (the first release with `corridor mdm provision`), or when the CLI did not install. On macOS that path lives in `src/macos/legacy-provision.sh`. Inside a WSL distro whose default user is root, the script also takes the older path, because the CLI refuses to run as root.
 
@@ -44,7 +51,7 @@ The macOS scripts share one hardened implementation. Notes for all of them:
 - Corridor installs per user, into the home directory of the user who owns the console. When nobody is signed in, the script exits 1 instead of guessing an account. Configure your MDM to retry failed runs: a Retry Event on the Jamf Pro policy, "Max number of times to retry if script fails" in Intune, or continuous automations in Fleet.
 - The scripts read managed plists with `plutil -extract ... raw`, which needs macOS 12 or later.
 - Optional: set `CORRIDOR_CLI_SHA256` near the top of the script to pin the expected SHA-256 of the Corridor CLI installer. The script logs the observed hash when it is unset.
-- The team token reaches `corridor mdm provision` (or, on the fallback path, `curl`) on stdin instead of argv, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted.
+- The team token reaches `curl` on stdin instead of argv and never reaches the CLI, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted.
 
 ## Available Scripts
 
@@ -94,7 +101,7 @@ The script reads the user's email and device serial from the managed plist, mirr
 
 ## Editing these scripts
 
-The four macOS scripts are generated from the templates in `src/macos/` (shared logic in `common.sh` and `prelude.sh`, the pre-CLI fallback in `legacy-provision.sh`, MDM-specific inputs in `kandji.sh`, `jamf.sh`, `fleet.sh`, and `intune.sh`). Edit the source, then run `scripts/build.sh` to regenerate `mdm/*-macos.sh`. Do not edit the generated files by hand.
+The four macOS scripts are generated from the templates in `src/macos/` (shared logic in `common.sh` and `prelude.sh`, token minting in `mint-token.sh`, the pre-CLI fallback in `legacy-provision.sh`, MDM-specific inputs in `kandji.sh`, `jamf.sh`, `fleet.sh`, and `intune.sh`). Edit the source, then run `scripts/build.sh` to regenerate `mdm/*-macos.sh`. Do not edit the generated files by hand.
 
 Enable the pre-commit hook, which rebuilds and stages the generated files, with `git config core.hooksPath .githooks`. Stage or stash changes to generator inputs and generated scripts before committing. The hook rejects unstaged changes and untracked generator inputs.
 

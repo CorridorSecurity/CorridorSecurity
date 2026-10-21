@@ -318,6 +318,98 @@ function Get-UserProfilePath {
     return "C:\Users\$Username"
 }
 
+function Invoke-MdmSyncDevice {
+    <#
+    .SYNOPSIS
+        Mints a per-user API token for one platform with the team token.
+    .DESCRIPTION
+        Returns [pscustomobject]@{ ApiToken; ApiTokenId } on success. Returns
+        $null after logging on a non-200, so the caller can record the failure
+        and go on. An unreachable API or an unparseable response exits 1.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Platform,
+        [Parameter(Mandatory = $true)][string]$Serial
+    )
+
+    Write-Log "Creating API token for $Platform..."
+
+    $body = @{
+        deviceSerial = $Serial
+        userEmail    = $UserEmail
+        platform     = $Platform
+    } | ConvertTo-Json -Compress
+
+    # Write the body to a temp file and POST it with curl --data-binary. This
+    # sidesteps Windows curl JSON-escaping issues, and Invoke-RestMethod's habit
+    # of downgrading to GET on some 5.1 builds.
+    $bodyFile = Join-Path $env:TEMP "corridor-mdm-body.json"
+    Set-Content -Path $bodyFile -Encoding ascii -NoNewline -Value $body
+
+    # The Authorization header goes through a curl config on stdin to keep the
+    # team-wide token out of argv. No --retry: this call mints a token, so a
+    # retried POST would leave extra live credentials behind.
+    $curlArgs = @(
+        "-s",
+        "-S",
+        "--config", "-",
+        "--proto", "=https",
+        "--tlsv1.2",
+        "--connect-timeout", "15",
+        "--max-time", "60",
+        "-w", "`n%{http_code}",
+        "-X", "POST",
+        "-H", "Content-Type: application/json",
+        "--data-binary", "@$bodyFile",
+        "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"
+    )
+    $curl = Invoke-NativeCommand -FilePath "curl.exe" -Arguments $curlArgs `
+        -InputText "header = `"Authorization: Bearer $CORRIDOR_TEAM_TOKEN`""
+
+    Remove-Item -Path $bodyFile -Force -ErrorAction SilentlyContinue
+
+    if ($curl.ExitCode -ne 0) {
+        Write-Log "Failed to connect to Corridor API for $Platform (curl exit code: $($curl.ExitCode))" -Level ERROR
+        exit 1
+    }
+
+    # Split the trailing status code (curl -w "`n%{http_code}") from the body.
+    $trimmed = $curl.Output.TrimEnd("`r", "`n")
+    $newlineIndex = $trimmed.LastIndexOf("`n")
+    if ($newlineIndex -ge 0) {
+        $httpCode = $trimmed.Substring($newlineIndex + 1).Trim()
+        $responseBody = $trimmed.Substring(0, $newlineIndex)
+    }
+    else {
+        $httpCode = $trimmed.Trim()
+        $responseBody = ""
+    }
+
+    if ($httpCode -ne "200") {
+        Write-Log "Failed to provision token for $Platform. HTTP $httpCode" -Level ERROR
+        Write-Log "Response body: $(Format-Redacted $responseBody)" -Level ERROR
+        return $null
+    }
+
+    try {
+        $response = $responseBody | ConvertFrom-Json
+    }
+    catch {
+        Write-Log "Could not parse Corridor API response for $Platform" -Level ERROR
+        exit 1
+    }
+
+    if ([string]::IsNullOrEmpty($response.apiToken)) {
+        Write-Log "Could not extract API token from response for $Platform" -Level ERROR
+        exit 1
+    }
+
+    return [pscustomobject]@{
+        ApiToken   = $response.apiToken
+        ApiTokenId = $response.apiTokenId
+    }
+}
+
 # ============================================================================
 # MAIN SCRIPT
 # ============================================================================
@@ -430,27 +522,66 @@ catch {
 # ============================================================================
 # Provision through the Corridor CLI
 # ============================================================================
-# This script already runs as the logged-on user, which `corridor mdm provision`
-# requires (it refuses LocalSystem). The team token goes on stdin to stay out of
-# argv. Intune stores serials with whitespace stripped, and the CLI rejects
-# whitespace, so pass the stripped form.
+# This script already runs as the logged-on user, which the CLI requires (it
+# refuses LocalSystem). The team token still stays out of the CLI: this script
+# mints each per-user token and hands the CLI only those, on stdin to stay out
+# of argv. Intune stores serials with whitespace stripped, and the CLI rejects
+# whitespace, so use the stripped form.
 $PlatformFailure = $false
 $CliVersion = if ($CliInstalled) { Get-CorridorCliVersion -CliExe $CorridorCliExe } else { "" }
 
 if (Test-VersionAtLeast -Version $CliVersion -Minimum $CORRIDOR_MIN_PROVISION_VERSION) {
     Write-Log "Provisioning $CurrentUser with corridor $CliVersion..."
-    $provision = Invoke-NativeCommand -FilePath $CorridorCliExe -Arguments @(
-        "mdm", "provision",
-        "--email", $UserEmail,
-        "--serial", ($DeviceSerial -replace '\s', ''),
-        "--api-url", $CORRIDOR_API_URL
-    ) -InputText $CORRIDOR_TEAM_TOKEN
-    if ($provision.Output) {
-        Write-Log "corridor mdm provision output:`n$($provision.Output.TrimEnd())"
+    $StrippedSerial = ($DeviceSerial -replace '\s', '')
+
+    # Output merges stderr into stdout, so keep only lines that are exactly a
+    # known platform name and drop the CLI's log lines.
+    $platformsResult = Invoke-NativeCommand -FilePath $CorridorCliExe -Arguments @("mdm", "platforms")
+    $MintPlatforms = @()
+    if ($platformsResult.ExitCode -ne 0) {
+        Write-Log "corridor mdm platforms failed (exit $($platformsResult.ExitCode)): $(Format-Redacted $platformsResult.Output)" -Level ERROR
     }
-    if ($provision.ExitCode -ne 0) {
-        Write-Log "corridor mdm provision failed (exit $($provision.ExitCode)). See its output above; Intune will retry on a later check-in." -Level ERROR
+    else {
+        foreach ($line in ($platformsResult.Output -split "`r?`n")) {
+            $name = $line.Trim()
+            if ((@("cursor", "vscode", "windsurf", "cli") -ccontains $name) -and ($MintPlatforms -cnotcontains $name)) {
+                $MintPlatforms += $name
+            }
+        }
+    }
+
+    $TokenLines = @()
+    foreach ($platform in $MintPlatforms) {
+        $minted = Invoke-MdmSyncDevice -Platform $platform -Serial $StrippedSerial
+        if (-not $minted) {
+            $PlatformFailure = $true
+            continue
+        }
+        $TokenLines += (ConvertTo-Json -Compress -InputObject ([ordered]@{
+            platform   = $platform
+            apiToken   = $minted.ApiToken
+            apiTokenId = $minted.ApiTokenId
+        }))
+    }
+
+    if ($TokenLines.Count -eq 0) {
+        Write-Log "No API token was minted. See the messages above; Intune will retry on a later check-in." -Level ERROR
         $PlatformFailure = $true
+    }
+    else {
+        $provision = Invoke-NativeCommand -FilePath $CorridorCliExe -Arguments @(
+            "mdm", "provision",
+            "--email", $UserEmail,
+            "--serial", $StrippedSerial,
+            "--api-url", $CORRIDOR_API_URL
+        ) -InputText ($TokenLines -join "`n")
+        if ($provision.Output) {
+            Write-Log "corridor mdm provision output:`n$($provision.Output.TrimEnd())"
+        }
+        if ($provision.ExitCode -ne 0) {
+            Write-Log "corridor mdm provision failed (exit $($provision.ExitCode)). See its output above; Intune will retry on a later check-in." -Level ERROR
+            $PlatformFailure = $true
+        }
     }
 }
 else {
@@ -591,85 +722,16 @@ else {
     # Provision user and create a separate API token for each platform
     # ============================================================================
     Write-Log "Provisioning user with Corridor..."
-    $mdmSyncUri = "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"
     $PlatformFailure = $false
 
     foreach ($platform in $ProvisionPlatforms) {
-        Write-Log "Creating API token for $platform..."
-
-        $body = @{
-            deviceSerial = $DeviceSerial
-            userEmail    = $UserEmail
-            platform     = $platform
-        } | ConvertTo-Json -Compress
-
-        # Write the body to a temp file and POST it with curl --data-binary. This
-        # sidesteps Windows curl JSON-escaping issues, and Invoke-RestMethod's habit
-        # of downgrading to GET on some 5.1 builds.
-        $bodyFile = Join-Path $env:TEMP "corridor-mdm-body.json"
-        Set-Content -Path $bodyFile -Encoding ascii -NoNewline -Value $body
-
-        # The Authorization header goes through a curl config on stdin to keep the
-        # team-wide token out of argv. No --retry: this call mints a token, so a
-        # retried POST would leave extra live credentials behind.
-        $curlArgs = @(
-            "-s",
-            "-S",
-            "--config", "-",
-            "--proto", "=https",
-            "--tlsv1.2",
-            "--connect-timeout", "15",
-            "--max-time", "60",
-            "-w", "`n%{http_code}",
-            "-X", "POST",
-            "-H", "Content-Type: application/json",
-            "--data-binary", "@$bodyFile",
-            $mdmSyncUri
-        )
-        $curl = Invoke-NativeCommand -FilePath "curl.exe" -Arguments $curlArgs `
-            -InputText "header = `"Authorization: Bearer $CORRIDOR_TEAM_TOKEN`""
-
-        Remove-Item -Path $bodyFile -Force -ErrorAction SilentlyContinue
-
-        if ($curl.ExitCode -ne 0) {
-            Write-Log "Failed to connect to Corridor API for $platform (curl exit code: $($curl.ExitCode))" -Level ERROR
-            exit 1
-        }
-
-        # Split the trailing status code (curl -w "`n%{http_code}") from the body.
-        $trimmed = $curl.Output.TrimEnd("`r", "`n")
-        $newlineIndex = $trimmed.LastIndexOf("`n")
-        if ($newlineIndex -ge 0) {
-            $httpCode = $trimmed.Substring($newlineIndex + 1).Trim()
-            $responseBody = $trimmed.Substring(0, $newlineIndex)
-        }
-        else {
-            $httpCode = $trimmed.Trim()
-            $responseBody = ""
-        }
-
-        if ($httpCode -ne "200") {
-            Write-Log "Failed to provision token for $platform. HTTP $httpCode" -Level ERROR
-            Write-Log "Response body: $(Format-Redacted $responseBody)" -Level ERROR
+        $minted = Invoke-MdmSyncDevice -Platform $platform -Serial $DeviceSerial
+        if (-not $minted) {
             $PlatformFailure = $true
             continue
         }
-
-        try {
-            $response = $responseBody | ConvertFrom-Json
-        }
-        catch {
-            Write-Log "Could not parse Corridor API response for $platform" -Level ERROR
-            exit 1
-        }
-
-        $apiToken = $response.apiToken
-        $apiTokenId = $response.apiTokenId
-
-        if ([string]::IsNullOrEmpty($apiToken)) {
-            Write-Log "Could not extract API token from response for $platform" -Level ERROR
-            exit 1
-        }
+        $apiToken = $minted.ApiToken
+        $apiTokenId = $minted.ApiTokenId
 
         # Each platform gets its own subdirectory: .corridor/cursor, .corridor/vscode,
         # .corridor/windsurf, .corridor/cli. The IDE extensions and CLI read
@@ -790,7 +852,7 @@ trap 'rm -f "$installer" "$resp_file"' EXIT
 #    file first so a truncated download cannot partly run. CI=1 keeps it
 #    non-interactive; CORRIDOR_MDM=1 updates ~/.bashrc and defers plugin setup.
 curl -fsSL --proto '=https' --tlsv1.2 -o "$installer" https://app.corridor.dev/cli/install.sh
-CI=1 CORRIDOR_MDM=1 bash "$installer"
+env -u COR_TOKEN CI=1 CORRIDOR_MDM=1 bash "$installer"
 CORRIDOR_BIN="$HOME/.corridor/bin/corridor"
 [ -x "$CORRIDOR_BIN" ] || { echo "Corridor CLI missing after install at $CORRIDOR_BIN"; exit 4; }
 
@@ -807,15 +869,82 @@ version_at_least() {
     return 0
 }
 
+# Mint one per-user token. Sets nothing global except the response in $resp_file;
+# returns 1 after printing on a non-200 (a non-200 body is an error message and
+# never contains a token). The team token reaches curl as a config on its own
+# stdin (the pipe), keeping it out of argv; this does not touch the stdin bash
+# is reading this script from. A curl failure exits with curl's own status.
+mint_token() {
+    local platform="$1" serial="$2" body http
+    body=$(printf '{"deviceSerial":"%s","userEmail":"%s","platform":"%s"}' "$serial" "$COR_EMAIL" "$platform")
+    http=$(printf 'header = "Authorization: Bearer %s"\n' "$COR_TOKEN" | curl -sS --config - \
+        --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
+        -o "$resp_file" -w '%{http_code}' -X POST \
+        "$COR_API/extension-auth/mdm-sync-device" \
+        -H "Content-Type: application/json" \
+        --data-binary "$body") || exit $?
+    if [ "$http" != "200" ]; then
+        echo "mdm-sync-device failed for $platform: HTTP $http $(head -c 200 "$resp_file" 2>/dev/null | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g')"
+        return 1
+    fi
+}
+
+# Same charset rule as the macOS script, so values are safe to put in JSON.
+is_safe_value() {
+    [ -n "$1" ] && [ "${#1}" -le 256 ] || return 1
+    case "$1" in
+        *[!A-Za-z0-9._@+=:/-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 # 2. Provision through the CLI. It refuses to run as root, so a distro whose
-#    default user is root keeps the legacy path. The token goes on the CLI's own
-#    stdin (the pipe), not the stdin bash is reading this script from. The CLI
-#    rejects whitespace in serials, and Intune stores them stripped.
+#    default user is root keeps the legacy path. The CLI may be swapped by the
+#    user, so it never sees the team token: this script mints each per-user
+#    token and pipes only those to the CLI's own stdin (the pipe, not the stdin
+#    bash is reading this script from). COR_TOKEN is in this shell's env via
+#    WSLENV, so the CLI runs under `env -u COR_TOKEN`. The CLI rejects
+#    whitespace in serials, and Intune stores them stripped.
 cli_version=$("$CORRIDOR_BIN" --version 2>/dev/null | awk 'NR == 1 { print $NF }' || true)
 if [ "$(id -u)" != "0" ] && version_at_least "$cli_version" "$COR_MIN_VERSION"; then
-    printf '%s\n' "$COR_TOKEN" | "$CORRIDOR_BIN" mdm provision \
-        --email "$COR_EMAIL" --serial "$(printf '%s' "$COR_SERIAL" | tr -d '[:space:]')" \
-        --api-url "$COR_API"
+    serial="$(printf '%s' "$COR_SERIAL" | tr -d '[:space:]')"
+    platforms=$(env -u COR_TOKEN "$CORRIDOR_BIN" mdm platforms 2>/dev/null </dev/null) \
+        || { echo "corridor mdm platforms failed"; exit 7; }
+
+    token_lines=""
+    seen=" "
+    failed=0
+    while IFS= read -r platform; do
+        case "$platform" in
+            "") continue ;;
+            cursor|vscode|windsurf|cli) ;;
+            *)
+                echo "Ignoring unexpected platform: $(printf '%s' "$platform" | head -c 100 | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g')"
+                continue
+                ;;
+        esac
+        case "$seen" in *" $platform "*) continue ;; esac
+        seen="$seen$platform "
+
+        if ! mint_token "$platform" "$serial"; then
+            failed=1
+            continue
+        fi
+        token=$(sed -n 's/.*"apiToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$resp_file")
+        token_id=$(sed -n 's/.*"apiTokenId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$resp_file")
+        case "$token" in cor_*) ;; *) echo "Could not extract apiToken for $platform from response"; exit 6 ;; esac
+        if ! is_safe_value "$token" || ! is_safe_value "$token_id"; then
+            echo "Token response for $platform contains unexpected characters"
+            exit 6
+        fi
+        token_lines="$token_lines$(printf '{"platform":"%s","apiToken":"%s","apiTokenId":"%s"}' \
+            "$platform" "$token" "$token_id")"$'\n'
+    done <<< "$platforms"
+
+    [ -n "$token_lines" ] || { echo "No API token was minted"; exit 5; }
+    printf '%s' "$token_lines" | env -u COR_TOKEN "$CORRIDOR_BIN" mdm provision \
+        --email "$COR_EMAIL" --serial "$serial" --api-url "$COR_API"
+    [ "$failed" -eq 0 ] || { echo "One or more platform token provisions failed"; exit 5; }
     echo "Corridor WSL provisioning complete for $(whoami)"
     exit 0
 fi
@@ -823,22 +952,9 @@ echo "Using in-script provisioning (corridor ${cli_version:-unknown}, uid $(id -
 
 # Legacy in-script provisioning. Remove once every supported CLI release has
 # `corridor mdm provision` and root distros are handled.
-# 3. Provision a CLI token. Capture status + body so a non-200 fails loudly
-#    (a non-200 body is an error message and never contains a token).
+# 3. Provision a CLI token. A non-200 fails loudly.
 mkdir -p "$HOME/.corridor/cli"; chmod 700 "$HOME/.corridor" "$HOME/.corridor/cli"
-body=$(printf '{"deviceSerial":"%s","userEmail":"%s","platform":"cli"}' "$COR_SERIAL" "$COR_EMAIL")
-# The token reaches curl as a config on its own stdin (the pipe), keeping it out
-# of argv; this does not touch the stdin bash is reading this script from.
-http=$(printf 'header = "Authorization: Bearer %s"\n' "$COR_TOKEN" | curl -sS --config - \
-    --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
-    -o "$resp_file" -w '%{http_code}' -X POST \
-    "$COR_API/extension-auth/mdm-sync-device" \
-    -H "Content-Type: application/json" \
-    --data-binary "$body")
-if [ "$http" != "200" ]; then
-    echo "mdm-sync-device failed: HTTP $http $(head -c 200 "$resp_file" 2>/dev/null | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g')"
-    exit 5
-fi
+mint_token cli "$COR_SERIAL" || exit 5
 
 # 4. Write the pending-token. Read the response file BY PATH (argv), not stdin, so
 #    there is no clash with how this script itself is fed to bash. python3 preferred;
