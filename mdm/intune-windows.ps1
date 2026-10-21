@@ -44,6 +44,8 @@
 # ============================================================================
 $CORRIDOR_TEAM_TOKEN = "cor-team_..."
 $GRAPH_API_TOKEN = "YOUR_GRAPH_API_TOKEN_HERE"
+# Optional: expected SHA-256 of the CLI installer. The script logs the observed hash when unset.
+$CORRIDOR_CLI_SHA256 = ""
 
 # ============================================================================
 # SCRIPT LOGIC - Do not modify below this line
@@ -101,18 +103,25 @@ function Invoke-NativeCommand {
         $ErrorActionPreference so a native command writing to stderr cannot raise
         a terminating "NativeCommandError" under the script's Stop preference.
         Arguments are passed as an array (never string-interpolated into a command
-        line) to avoid quoting/command-injection issues.
+        line) to avoid quoting/command-injection issues. InputText, when set, is
+        written to the command's stdin so secrets can stay out of argv.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [string[]]$Arguments = @()
+        [string[]]$Arguments = @(),
+        [string]$InputText
     )
 
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
         $global:LASTEXITCODE = 0
-        $output = & $FilePath @Arguments 2>&1 | Out-String
+        if ($PSBoundParameters.ContainsKey("InputText")) {
+            $output = $InputText | & $FilePath @Arguments 2>&1 | Out-String
+        }
+        else {
+            $output = & $FilePath @Arguments 2>&1 | Out-String
+        }
         return [pscustomobject]@{
             Output   = $output
             ExitCode = $LASTEXITCODE
@@ -121,6 +130,15 @@ function Invoke-NativeCommand {
     finally {
         $ErrorActionPreference = $previous
     }
+}
+
+# Intune keeps script output, so scrub team (cor-) and API (cor_) tokens from logged text.
+function Format-Redacted {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return "" }
+    $flat = ($Text -replace "[\r\n]", " ")
+    if ($flat.Length -gt 200) { $flat = $flat.Substring(0, 200) }
+    return ($flat -replace "cor[_-][A-Za-z0-9._-]*", "[redacted]")
 }
 
 function Set-UserOnlyAcl {
@@ -357,21 +375,32 @@ try {
     $installerPath = Join-Path $env:TEMP "corridor-cli-install.ps1"
     Invoke-WebRequest -Uri $CLI_INSTALL_URL -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
 
-    $cliResult = Invoke-NativeCommand -FilePath "powershell.exe" -Arguments @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $installerPath
-    )
-    if ($cliResult.Output) {
-        Write-Log "Corridor CLI installer output:`n$($cliResult.Output.TrimEnd())"
-    }
-
-    Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
-
-    if ($cliResult.ExitCode -eq 0) {
-        $CliInstalled = $true
-        Write-Log "Corridor CLI installed successfully" -Level SUCCESS
+    $installerSha256 = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($CORRIDOR_CLI_SHA256 -and $installerSha256 -ne $CORRIDOR_CLI_SHA256.ToLowerInvariant()) {
+        Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+        Write-Log "Corridor CLI installer checksum mismatch (expected $CORRIDOR_CLI_SHA256, got $installerSha256). Refusing to run it." -Level ERROR
     }
     else {
-        Write-Log "Corridor CLI installer exited with code $($cliResult.ExitCode) (continuing with extension provisioning)" -Level ERROR
+        if (-not $CORRIDOR_CLI_SHA256) {
+            Write-Log "Corridor CLI installer SHA-256 is $installerSha256 (not verified - set CORRIDOR_CLI_SHA256 to pin it)"
+        }
+
+        $cliResult = Invoke-NativeCommand -FilePath "powershell.exe" -Arguments @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $installerPath
+        )
+        if ($cliResult.Output) {
+            Write-Log "Corridor CLI installer output:`n$($cliResult.Output.TrimEnd())"
+        }
+
+        Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+
+        if ($cliResult.ExitCode -eq 0) {
+            $CliInstalled = $true
+            Write-Log "Corridor CLI installed successfully" -Level SUCCESS
+        }
+        else {
+            Write-Log "Corridor CLI installer exited with code $($cliResult.ExitCode) (continuing with extension provisioning)" -Level ERROR
+        }
     }
 }
 catch {
@@ -466,6 +495,9 @@ else {
 # ============================================================================
 # Install the Corridor extension for each detected editor
 # ============================================================================
+# NODE_USE_SYSTEM_CA=1 adds the Windows certificate store to the editor's bundled
+# CA list, so installs work behind TLS-intercepting proxies (Zscaler, etc.).
+$env:NODE_USE_SYSTEM_CA = "1"
 foreach ($editor in $InstalledEditors) {
     Write-Log "Installing Corridor extension for $($editor.Name)..."
 
@@ -496,7 +528,7 @@ foreach ($editor in $InstalledEditors) {
             Write-Log "Corridor extension is already installed for $($editor.Name)"
         }
         else {
-            Write-Log "Failed to install Corridor extension for $($editor.Name) (exit $($install.ExitCode)): $output" -Level ERROR
+            Write-Log "Failed to install Corridor extension for $($editor.Name) (exit $($install.ExitCode)): $(Format-Redacted $output)" -Level ERROR
             exit 1
         }
     }
@@ -507,6 +539,7 @@ foreach ($editor in $InstalledEditors) {
 # ============================================================================
 Write-Log "Provisioning user with Corridor..."
 $mdmSyncUri = "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"
+$PlatformFailure = $false
 
 foreach ($platform in $ProvisionPlatforms) {
     Write-Log "Creating API token for $platform..."
@@ -523,17 +556,25 @@ foreach ($platform in $ProvisionPlatforms) {
     $bodyFile = Join-Path $env:TEMP "corridor-mdm-body.json"
     Set-Content -Path $bodyFile -Encoding ascii -NoNewline -Value $body
 
+    # The Authorization header goes through a curl config on stdin to keep the
+    # team-wide token out of argv. No --retry: this call mints a token, so a
+    # retried POST would leave extra live credentials behind.
     $curlArgs = @(
         "-s",
         "-S",
+        "--config", "-",
+        "--proto", "=https",
+        "--tlsv1.2",
+        "--connect-timeout", "15",
+        "--max-time", "60",
         "-w", "`n%{http_code}",
         "-X", "POST",
-        "-H", "Authorization: Bearer $CORRIDOR_TEAM_TOKEN",
         "-H", "Content-Type: application/json",
         "--data-binary", "@$bodyFile",
         $mdmSyncUri
     )
-    $curl = Invoke-NativeCommand -FilePath "curl.exe" -Arguments $curlArgs
+    $curl = Invoke-NativeCommand -FilePath "curl.exe" -Arguments $curlArgs `
+        -InputText "header = `"Authorization: Bearer $CORRIDOR_TEAM_TOKEN`""
 
     Remove-Item -Path $bodyFile -Force -ErrorAction SilentlyContinue
 
@@ -556,9 +597,9 @@ foreach ($platform in $ProvisionPlatforms) {
 
     if ($httpCode -ne "200") {
         Write-Log "Failed to provision token for $platform. HTTP $httpCode" -Level ERROR
-        # A non-200 body is an error message (never contains an API token).
-        Write-Log "Response body: $responseBody" -Level ERROR
-        exit 1
+        Write-Log "Response body: $(Format-Redacted $responseBody)" -Level ERROR
+        $PlatformFailure = $true
+        continue
     }
 
     try {
@@ -605,7 +646,12 @@ foreach ($platform in $ProvisionPlatforms) {
     Write-Log "Pending token for $platform stored in $pendingTokenFile" -Level SUCCESS
 }
 
-Write-Log "User provisioned successfully!" -Level SUCCESS
+if ($PlatformFailure) {
+    Write-Log "One or more platform token provisions failed; successful platforms were processed." -Level ERROR
+}
+else {
+    Write-Log "User provisioned successfully!" -Level SUCCESS
+}
 Write-Log "The Corridor extension will migrate tokens for each editor to secure storage on next launch of that editor"
 
 # ============================================================================
@@ -693,13 +739,16 @@ umask 077
 resp_file="$(mktemp)"
 trap 'rm -f "$resp_file"' EXIT
 body=$(printf '{"deviceSerial":"%s","userEmail":"%s","platform":"cli"}' "$COR_SERIAL" "$COR_EMAIL")
-http=$(curl -sS -o "$resp_file" -w '%{http_code}' -X POST \
+# The token reaches curl as a config on its own stdin (the pipe), keeping it out
+# of argv; this does not touch the stdin bash is reading this script from.
+http=$(printf 'header = "Authorization: Bearer %s"\n' "$COR_TOKEN" | curl -sS --config - \
+    --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
+    -o "$resp_file" -w '%{http_code}' -X POST \
     "$COR_API/extension-auth/mdm-sync-device" \
-    -H "Authorization: Bearer $COR_TOKEN" \
     -H "Content-Type: application/json" \
     --data-binary "$body")
 if [ "$http" != "200" ]; then
-    echo "mdm-sync-device failed: HTTP $http $(cat "$resp_file" 2>/dev/null)"
+    echo "mdm-sync-device failed: HTTP $http $(head -c 200 "$resp_file" 2>/dev/null | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g')"
     exit 5
 fi
 
@@ -772,6 +821,11 @@ echo "Corridor WSL provisioning complete for $(whoami)"
 }
 else {
     Write-Log "WSL not present; skipping WSL provisioning."
+}
+
+if ($PlatformFailure) {
+    Write-Log "Corridor provisioning completed with one or more platform token failures." -Level ERROR
+    exit 1
 }
 
 Write-Log "Corridor MDM provisioning complete!" -Level SUCCESS

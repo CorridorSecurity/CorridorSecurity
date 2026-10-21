@@ -7,7 +7,7 @@ For detailed instructions on how to run these on your MDM, refer to the [MDM Sup
 
 These scripts automate the deployment of the Corridor extension to developer machines. For each managed device, they will:
 
-1. **Detect installed editors** - Scan for Cursor, VS Code, and Windsurf
+1. **Detect installed editors** - Scan for Cursor, VS Code, Windsurf, and Devin Desktop
 2. **Install the Corridor extension** - Use each editor's CLI to install the extension
 3. **Provision API tokens** - Create per-editor API tokens for the user and store them for the extension to pick up on next launch
 
@@ -26,6 +26,13 @@ The scripts also download and install the Corridor CLI for the logged-in user, p
 | Fleet | macOS | `fleet-macos.sh` | `fleet-dev.corridor.mdm.mobileconfig` (configuration profile) |
 
 Every script needs the user's email and the device serial number to provision tokens; the scripts differ mainly in how their MDM supplies those two values.
+
+The macOS scripts share one hardened implementation. Notes for all of them:
+
+- Corridor installs per user, into the home directory of the user who owns the console. When nobody is signed in, the script exits 1 instead of guessing an account. Configure your MDM to retry failed runs: a Retry Event on the Jamf Pro policy, "Max number of times to retry if script fails" in Intune, or continuous automations in Fleet.
+- The scripts read managed plists with `plutil -extract ... raw`, which needs macOS 12 or later.
+- Optional: set `CORRIDOR_CLI_SHA256` near the top of the script to pin the expected SHA-256 of the Corridor CLI installer. The script logs the observed hash when it is unset.
+- The team token reaches `curl` through a config file on stdin instead of argv, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted.
 
 ## Available Scripts
 
@@ -71,4 +78,10 @@ For MacOS devices managed by **Fleet** ([fleetdm.com](https://fleetdm.com)), run
 - The developer signed in at the Mac. Corridor installs per user, into the home directory of the user who owns the console. When nobody is signed in, the script exits 1 instead of guessing an account. Fleet retries a failed script up to 3 times. Set the policy's `continuous_automations_enabled` to true so it runs again on later check-ins until the developer is signed in
 - Optional: set `CORRIDOR_CLI_SHA256` in the script to pin the expected SHA-256 of the Corridor CLI installer. The script logs the observed hash when unset
 
-The script reads the user's email and device serial from the managed plist, mirroring the Jamf Pro flow. It is hardened beyond the other MDM scripts: the team token reaches `curl` through a config file on stdin instead of argv, token files are written as the target user rather than as root, MDM-supplied values are charset-validated before use, and logged output is redacted, since Fleet stores script output verbatim.
+The script reads the user's email and device serial from the managed plist, mirroring the Jamf Pro flow. Fleet stores script output verbatim, so redaction matters most here.
+
+## Editing these scripts
+
+The four macOS scripts are generated from the templates in `src/macos/` (shared logic in `common.sh` and `prelude.sh`, MDM-specific inputs in `kandji.sh`, `jamf.sh`, `fleet.sh`, and `intune.sh`). Edit the source, then run `scripts/build.sh` to regenerate `mdm/*-macos.sh`. Do not edit the generated files by hand.
+
+Enable the pre-commit hook, which rebuilds and stages the generated files, with `git config core.hooksPath .githooks`. CI runs `scripts/build.sh --check` and fails if a generated file is stale.

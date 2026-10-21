@@ -5,12 +5,15 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   powershell-parse:
     name: PowerShell parse check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Parse-check PowerShell MDM scripts
         shell: pwsh
@@ -38,3 +41,19 @@ jobs:
           }
 
           if ($failed) { exit 1 }
+
+  generated-scripts:
+    name: Generated MDM scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Generated scripts are up to date
+        run: scripts/build.sh --check
+
+      - name: Syntax check
+        run: |
+          for f in mdm/*.sh; do bash -n "$f"; done
+
+      - name: ShellCheck
+        run: shellcheck -S warning mdm/*-macos.sh

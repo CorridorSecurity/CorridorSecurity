@@ -1,38 +1,53 @@
 #!/bin/bash
+# GENERATED from src/macos/kandji.sh by scripts/build.sh - edit the source, not this file.
 #
 # Corridor MDM Provisioning Script for Kandji MacOS Devices
 #
 # This script is designed to be deployed via Kandji.
-# It detects if supported editors (Cursor, VS Code, Windsurf) are installed,
-# installs the Corridor extension on all detected editors, and provisions
-# the user with an API token for authentication.
+# It detects if supported editors (Cursor, VS Code, Windsurf, Devin Desktop)
+# are installed, installs the Corridor extension on all detected editors,
+# installs the Corridor CLI, and provisions the user with API tokens for
+# authentication.
 #
 # Configuration:
 #   CORRIDOR_TEAM_TOKEN - Your team's Universal Team Token (required)
+#   CORRIDOR_CLI_SHA256 - Optional expected SHA-256 of the CLI installer.
 #
-# Kandji Global Variables Used:
-#   $EMAIL - User's email from device assignment (injected by Kandji)
-#   $SERIAL_NUMBER - Device serial number from Kandji global variables
+# Kandji Global Variables Used (read from
+# /Library/Managed Preferences/io.kandji.globalvariables.plist):
+#   EMAIL - User's email from device assignment (injected by Kandji)
+#   SERIAL_NUMBER - Device serial number from Kandji global variables
 #
 # Basic Usage:
 #   1. Get a Universal Team Token from your Corridor team settings
 #   2. Replace the CORRIDOR_TEAM_TOKEN value below with your token
 #   3. Deploy this script via Kandji as a Custom Script
 #
-
 # ============================================================================
 # CONFIGURATION - Replace with your actual values
 # ============================================================================
 CORRIDOR_TEAM_TOKEN="cor-team_..."
+CORRIDOR_CLI_SHA256=''
 
 # ============================================================================
 # SCRIPT LOGIC - Do not modify below this line
 # ============================================================================
 
 set -e
+set -o pipefail
+
+# Fixed PATH so utilities cannot be shadowed by the MDM agent's root environment.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 LOG_PREFIX="[Corridor MDM]"
 CORRIDOR_API_URL="https://app.corridor.dev/api"
+CORRIDOR_CLI_INSTALL_URL="https://app.corridor.dev/cli/install.sh"
+EXTENSION_INSTALL_TIMEOUT=60
+EXTENSION_PHASE_TIMEOUT=150
+
+# The MDM agent may run from a directory the console user cannot read; use a stable
+# working directory so child processes do not emit getcwd errors.
+cd /
 
 log_info() {
     echo "$LOG_PREFIX INFO: $1"
@@ -42,113 +57,301 @@ log_error() {
     echo "$LOG_PREFIX ERROR: $1" >&2
 }
 
+log_warn() {
+    echo "$LOG_PREFIX WARNING: $1"
+}
+
 log_success() {
     echo "$LOG_PREFIX SUCCESS: $1"
 }
 
-# Function to get the currently logged-in interactive user
-get_current_user() {
-    # Get the user who owns the console (most reliable method, esp since the user may be root)
-    local user
-    user=$(stat -f "%Su" /dev/console)
-
-    # Filter out system accounts
-    if [ "$user" = "root" ] || [ "$user" = "_mbsetupuser" ]; then
-        # Fallback: get the most recent GUI user
-        user=$(last -1 -t console | awk '{print $1}' | head -1)
+CLI_INSTALLER=""
+CORRIDOR_TOKEN_FILE=""
+EXTENSION_OUTPUT_FILE=""
+cleanup() {
+    if [ -n "$CLI_INSTALLER" ]; then
+        rm -f "$CLI_INSTALLER"
     fi
+    if [ -n "$CORRIDOR_TOKEN_FILE" ]; then
+        rm -f "$CORRIDOR_TOKEN_FILE"
+    fi
+    if [ -n "$EXTENSION_OUTPUT_FILE" ]; then
+        rm -f "$EXTENSION_OUTPUT_FILE"
+    fi
+}
+trap cleanup EXIT
 
-    echo "$user"
+# Rejecting quotes, backslashes and whitespace here is what makes it safe to
+# interpolate these values into JSON, curl config and file contents below.
+is_safe_value() {
+    if [ -z "$1" ] || [ "${#1}" -gt 256 ]; then
+        return 1
+    fi
+    case "$1" in
+        *[!A-Za-z0-9._@+=:/-]*) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
-# Check if configuration is set
-if [ "$CORRIDOR_TEAM_TOKEN" = "cor-team_..." ] || [ -z "$CORRIDOR_TEAM_TOKEN" ]; then
-    log_error "CORRIDOR_TEAM_TOKEN is not configured. Please set your team token."
+# Stricter: account names become path components and a sudo -u target.
+is_safe_username() {
+    if [ -z "$1" ] || [ "${#1}" -gt 64 ]; then
+        return 1
+    fi
+    case "$1" in
+        -*|.*) return 1 ;;
+        *[!A-Za-z0-9._-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# MDM consoles store script output verbatim and do not redact secrets from it.
+# Team tokens use cor-…; minted API tokens use cor_… — both must be scrubbed.
+redact() {
+    printf '%s' "$1" | tr -d '\n' | cut -c1-200 | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g'
+}
+
+kill_process_tree() {
+    local parent_pid="$1"
+    local child_pid
+    for child_pid in $(pgrep -P "$parent_pid" 2>/dev/null); do
+        kill_process_tree "$child_pid"
+    done
+    kill -TERM "$parent_pid" 2>/dev/null || true
+    kill -KILL "$parent_pid" 2>/dev/null || true
+}
+
+run_extension_install() {
+    EXTENSION_OUTPUT_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-extension.XXXXXX")
+    launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
+        env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
+        --install-extension corridor.Corridor --force \
+        > "$EXTENSION_OUTPUT_FILE" 2>&1 &
+    local install_pid=$!
+    local elapsed=0
+    local phase_remaining=$((EXTENSION_PHASE_TIMEOUT - (SECONDS - EXTENSION_PHASE_START)))
+    local install_timeout="$EXTENSION_INSTALL_TIMEOUT"
+    if [ "$phase_remaining" -lt "$install_timeout" ]; then
+        install_timeout="$phase_remaining"
+    fi
+    INSTALL_TIMEOUT_USED="$install_timeout"
+    while kill -0 "$install_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$install_timeout" ]; then
+            kill_process_tree "$install_pid"
+            wait "$install_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$install_pid"
+}
+if [ -z "$CORRIDOR_TEAM_TOKEN" ] || [ "$CORRIDOR_TEAM_TOKEN" = "cor-team_..." ]; then
+    log_error "CORRIDOR_TEAM_TOKEN is not configured. Set your team token in the configuration section at the top of this script."
     exit 1
 fi
 
-# Set the device serial and the user email from Kandji global variables
-DEVICE_SERIAL=$(/usr/libexec/PlistBuddy -c 'print :SERIAL_NUMBER' /Library/Managed\ Preferences/io.kandji.globalvariables.plist)
+if ! is_safe_value "$CORRIDOR_TEAM_TOKEN"; then
+    log_error "CORRIDOR_TEAM_TOKEN contains unexpected characters. Re-copy the Universal Team Token without surrounding quotes or whitespace."
+    exit 1
+fi
+
+
+MANAGED_PLIST="/Library/Managed Preferences/io.kandji.globalvariables.plist"
+PLIST_SERIAL_KEY="SERIAL_NUMBER"
+PLIST_EMAIL_KEY="EMAIL"
+PLIST_PROFILE_NAME="the Kandji global variables profile"
+PLIST_MISSING_HINT="Confirm the Kandji global variables profile has been delivered to this host."
+IDENTITY_SOURCE="$MANAGED_PLIST"
+# ============================================================================
+# Read device configuration from the managed plist
+# ============================================================================
+# Expects MANAGED_PLIST, PLIST_SERIAL_KEY, PLIST_EMAIL_KEY, IDENTITY_SOURCE and
+# the hint variables used in the messages below.
+# MDM writes this path as root; anything else means the identity is not
+# authoritative.
+if [ -L "$MANAGED_PLIST" ] || [ ! -f "$MANAGED_PLIST" ]; then
+    log_error "Managed preferences file not found at $MANAGED_PLIST. $PLIST_MISSING_HINT"
+    exit 1
+fi
+
+if [ "$(stat -f '%u' "$MANAGED_PLIST")" != "0" ]; then
+    log_error "$MANAGED_PLIST is not owned by root. Refusing to read device identity from it."
+    exit 1
+fi
+
+# plutil reads the file directly, bypassing cfprefsd's cached view.
+DEVICE_SERIAL=$(plutil -extract "$PLIST_SERIAL_KEY" raw -o - "$MANAGED_PLIST" 2>/dev/null || echo "")
+USER_EMAIL=$(plutil -extract "$PLIST_EMAIL_KEY" raw -o - "$MANAGED_PLIST" 2>/dev/null || echo "")
+
 if [ -z "$DEVICE_SERIAL" ]; then
-    log_error "Could not retrieve device serial number"
+    log_error "Could not retrieve device serial number. Ensure $PLIST_PROFILE_NAME pushes $PLIST_SERIAL_KEY to $MANAGED_PLIST."
+    exit 1
+fi
+
+if [ -z "$USER_EMAIL" ]; then
+    log_error "Could not retrieve user email. Ensure $PLIST_PROFILE_NAME pushes $PLIST_EMAIL_KEY to $MANAGED_PLIST${PLIST_EMAIL_EMPTY_HINT:+, $PLIST_EMAIL_EMPTY_HINT}."
+    exit 1
+fi
+
+# ============================================================================
+# Validate device identity
+# ============================================================================
+# IDENTITY_SOURCE names where the values came from, for error messages.
+if ! is_safe_value "$DEVICE_SERIAL"; then
+    log_error "Device serial from $IDENTITY_SOURCE contains unexpected characters. Refusing to use it."
     exit 1
 fi
 log_info "Device Serial: $DEVICE_SERIAL"
 
-USER_EMAIL=$(/usr/libexec/PlistBuddy -c 'print :EMAIL' /Library/Managed\ Preferences/io.kandji.globalvariables.plist)
-if [ -z "$USER_EMAIL" ]; then
-    log_error "Could not retrieve user email"
+if ! is_safe_value "$USER_EMAIL"; then
+    log_error "User email from $IDENTITY_SOURCE contains unexpected characters. Refusing to use it."
     exit 1
 fi
+case "$USER_EMAIL" in
+    *@*.*) ;;
+    *)
+        log_error "User email '$USER_EMAIL' from $IDENTITY_SOURCE is not an email address.${EMAIL_SHAPE_HINT:+ $EMAIL_SHAPE_HINT}"
+        exit 1
+        ;;
+esac
 log_info "User email: $USER_EMAIL"
 
-# Get the current logged-in interactive user
-CURRENT_USER=$(get_current_user)
-if [ -z "$CURRENT_USER" ]; then
-    log_error "Could not retrieve logged-in username"
+# ============================================================================
+# Resolve the target user
+# ============================================================================
+# Console owner only. A "most recent GUI user" fallback would provision the
+# MDM-assigned user's token into whichever account last logged in.
+CURRENT_USER=$(stat -f "%Su" /dev/console)
+
+case "$CURRENT_USER" in
+    ""|root|_*)
+        log_error "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Corridor installs per user, so run this script while the developer is signed in. Exiting 1 so the MDM records a failure and retries on a later check-in."
+        exit 1
+        ;;
+esac
+
+if ! is_safe_username "$CURRENT_USER"; then
+    log_error "Console user name '$CURRENT_USER' contains unexpected characters. Refusing to provision."
     exit 1
 fi
-log_info "Current User: $CURRENT_USER"
+
+CURRENT_USER_UID=$(id -u "$CURRENT_USER" 2>/dev/null || echo "")
+case "$CURRENT_USER_UID" in
+    ""|*[!0-9]*)
+        log_error "Could not resolve a numeric UID for console user '$CURRENT_USER'."
+        exit 1
+        ;;
+esac
+if [ "$CURRENT_USER_UID" -lt 500 ]; then
+    log_error "Console user '$CURRENT_USER' is a system account (UID $CURRENT_USER_UID). Refusing to provision."
+    exit 1
+fi
+
+# dscl wraps long values onto a second line, so flatten before stripping the key.
+USER_HOME=$(dscl . -read "/Users/$CURRENT_USER" NFSHomeDirectory 2>/dev/null \
+    | tr '\n' ' ' | sed 's/^NFSHomeDirectory: *//; s/ *$//')
+if [ -z "$USER_HOME" ] || [ -L "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+    log_error "Could not resolve a home directory for '$CURRENT_USER'."
+    exit 1
+fi
+if [ "$(stat -f '%u' "$USER_HOME")" != "$CURRENT_USER_UID" ]; then
+    log_error "Home directory $USER_HOME is not owned by '$CURRENT_USER'. Refusing to provision."
+    exit 1
+fi
+log_info "Current User: $CURRENT_USER ($USER_HOME)"
+
+EMAIL_LOCAL_PART="${USER_EMAIL%%@*}"
+if [ "$CURRENT_USER" != "$EMAIL_LOCAL_PART" ]; then
+    log_warn "Console user '$CURRENT_USER' does not match the MDM-assigned user '$USER_EMAIL'. Tokens for $USER_EMAIL will be written to $USER_HOME - confirm this device is assigned to the person using it."
+fi
+
+CORRIDOR_CONFIG_DIR="$USER_HOME/.corridor"
 
 # ============================================================================
 # Install the Corridor CLI
 # ============================================================================
-# Download and install the Corridor CLI for the logged-in user. The installer
-# places the binary under the user's ~/.corridor/bin and symlinks it into
-# ~/.local/bin, so it must run as the interactive user (not root) for HOME to
-# resolve correctly. CI=1 skips the interactive Claude Code plugin setup, which
-# cannot run unattended in an MDM context. CORRIDOR_MDM=1 tells the installer
-# this is a persistent managed device so it still updates the shell profile.
+# Runs as the interactive user so HOME resolves to their ~/.corridor. CI=1 skips
+# the interactive plugin setup; CORRIDOR_MDM=1 marks this a persistent managed
+# device. Downloaded to a file rather than piped to bash so a truncated download
+# cannot partially execute and the bytes can be checksummed first.
 log_info "Installing the Corridor CLI for $CURRENT_USER..."
 
-CORRIDOR_CONFIG_DIR="/Users/$CURRENT_USER/.corridor"
 CLI_INSTALLED="false"
 
-if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" CI=1 CORRIDOR_MDM=1 \
-    bash -c 'set -o pipefail; curl -fsSL https://app.corridor.dev/cli/install.sh | bash'; then
-    log_success "Corridor CLI installed successfully"
-    CLI_INSTALLED="true"
+if ! CLI_INSTALLER=$(sudo -u "$CURRENT_USER" mktemp /tmp/corridor-cli-install.XXXXXX); then
+    CLI_INSTALLER=""
+    log_error "Could not create a temporary file to download the Corridor CLI installer (continuing with extension provisioning)"
+elif ! sudo -u "$CURRENT_USER" curl -fsSL \
+    --proto '=https' --tlsv1.2 \
+    --connect-timeout 15 --max-time 120 \
+    --retry 2 --retry-connrefused \
+    -o "$CLI_INSTALLER" "$CORRIDOR_CLI_INSTALL_URL"; then
+    log_error "Failed to download the Corridor CLI installer (continuing with extension provisioning)"
+elif [ ! -s "$CLI_INSTALLER" ]; then
+    log_error "Downloaded Corridor CLI installer is empty (continuing with extension provisioning)"
 else
-    log_error "Failed to install the Corridor CLI (continuing with extension provisioning)"
+    INSTALLER_SHA256=$(sudo -u "$CURRENT_USER" shasum -a 256 "$CLI_INSTALLER" | awk '{print $1}')
+    if [ -n "$CORRIDOR_CLI_SHA256" ] && [ "$INSTALLER_SHA256" != "$CORRIDOR_CLI_SHA256" ]; then
+        log_error "Corridor CLI installer checksum mismatch (expected $CORRIDOR_CLI_SHA256, got $INSTALLER_SHA256). Refusing to run it."
+    else
+        if [ -z "$CORRIDOR_CLI_SHA256" ]; then
+            log_info "Corridor CLI installer SHA-256 is $INSTALLER_SHA256 (not verified - set CORRIDOR_CLI_SHA256 to pin it)"
+        fi
+        if sudo -u "$CURRENT_USER" env HOME="$USER_HOME" CI=1 CORRIDOR_MDM=1 \
+            bash "$CLI_INSTALLER"; then
+            log_success "Corridor CLI installed successfully"
+            CLI_INSTALLED="true"
+        else
+            log_error "Failed to install the Corridor CLI (continuing with extension provisioning)"
+        fi
+    fi
 fi
 
-# Define supported editors (bash 3.x compatible - no associative arrays)
-EDITOR_NAMES="Cursor VSCode Windsurf"
+rm -f "$CLI_INSTALLER"
+CLI_INSTALLER=""
 
-# Define editor app names
+# ============================================================================
+# Detect editors and install the Corridor extension
+# ============================================================================
+# bash 3.x compatible - no associative arrays.
+EDITOR_NAMES="Cursor VSCode Windsurf Devin"
+
 get_editor_app_name() {
     case "$1" in
         Cursor)   echo "Cursor.app" ;;
         VSCode)   echo "Visual Studio Code.app" ;;
         Windsurf) echo "Windsurf.app" ;;
+        Devin)    echo "Devin.app" ;;
     esac
 }
 
-# Define editor platform names
 get_editor_platform() {
     case "$1" in
         Cursor)   echo "cursor" ;;
         VSCode)   echo "vscode" ;;
         Windsurf) echo "windsurf" ;;
+        # Placeholder until Corridor adds a dedicated Devin Desktop platform.
+        Devin)    echo "windsurf" ;;
     esac
 }
 
-# Define editor CLI binary names
 get_editor_cli() {
     case "$1" in
         Cursor)   echo "cursor" ;;
         VSCode)   echo "code" ;;
         Windsurf) echo "windsurf" ;;
+        Devin)    echo "devin-desktop" ;;
     esac
 }
 
-# Get the paths -- /Applications or /Users/${CURRENT_USER}/Downloads (VS code mainly)
 get_editor_app() {
     echo "/Applications/$(get_editor_app_name "$1")"
 }
 
+# VS Code in particular is often left in ~/Downloads.
 get_editor_app_alternative() {
-    echo "/Users/${CURRENT_USER}/Downloads/$(get_editor_app_name "$1")"
+    echo "$USER_HOME/Downloads/$(get_editor_app_name "$1")"
 }
 
 get_editor_cli_path() {
@@ -156,7 +359,7 @@ get_editor_cli_path() {
 }
 
 get_editor_cli_path_alternative() {
-    echo "/Users/${CURRENT_USER}/Downloads/$(get_editor_app_name "$1")/Contents/Resources/app/bin/$(get_editor_cli "$1")"
+    echo "$USER_HOME/Downloads/$(get_editor_app_name "$1")/Contents/Resources/app/bin/$(get_editor_cli "$1")"
 }
 
 get_editor_ext_dir() {
@@ -164,10 +367,10 @@ get_editor_ext_dir() {
         Cursor)  echo ".cursor/extensions" ;;
         VSCode)  echo ".vscode/extensions" ;;
         Windsurf) echo ".windsurf/extensions" ;;
+        Devin)   echo ".devin/extensions" ;;
     esac
 }
 
-# Check which editors are installed
 INSTALLED_EDITORS=""
 EDITOR_PATHS=""  # Track which path each editor was found at
 
@@ -186,48 +389,62 @@ for editor in $EDITOR_NAMES; do
     fi
 done
 
-# Trim leading space
 INSTALLED_EDITORS=$(echo "$INSTALLED_EDITORS" | sed 's/^ *//')
 
-# Build the list of platforms to provision tokens for: the platform for each
-# installed editor, plus "cli" if the Corridor CLI installed successfully.
+# One platform per installed editor, plus "cli" if the CLI installed.
 PROVISION_PLATFORMS=""
 for editor in $INSTALLED_EDITORS; do
-    PROVISION_PLATFORMS="$PROVISION_PLATFORMS $(get_editor_platform "$editor")"
+    PLATFORM=$(get_editor_platform "$editor")
+    case " $PROVISION_PLATFORMS " in
+        *" $PLATFORM "*) ;;
+        *) PROVISION_PLATFORMS="$PROVISION_PLATFORMS $PLATFORM" ;;
+    esac
 done
 if [ "$CLI_INSTALLED" = "true" ]; then
-    PROVISION_PLATFORMS="$PROVISION_PLATFORMS cli"
+    case " $PROVISION_PLATFORMS " in
+        *" cli "*) ;;
+        *) PROVISION_PLATFORMS="$PROVISION_PLATFORMS cli" ;;
+    esac
 fi
 PROVISION_PLATFORMS=$(echo "$PROVISION_PLATFORMS" | sed 's/^ *//')
 
-# Nothing to do if there are no editors and the CLI did not install
 if [ -z "$INSTALLED_EDITORS" ]; then
-    log_info "No supported editors (Cursor, VS Code, Windsurf) are installed. Skipping Corridor extension installation."
+    log_info "No supported editors (Cursor, VS Code, Windsurf, Devin) are installed. Skipping Corridor extension installation."
     if [ -z "$PROVISION_PLATFORMS" ]; then
         exit 0
     fi
 fi
 
-# Install Corridor extension for each installed editor
+skip_remaining_editors() {
+    if [ -n "$REMAINING_EDITORS" ]; then
+        log_warn "Editor extension phase budget of ${EXTENSION_PHASE_TIMEOUT}s exhausted; skipping editors: $REMAINING_EDITORS. They will be retried on the next check-in."
+    fi
+}
+
+EXTENSION_PHASE_START=$SECONDS
+REMAINING_EDITORS="$INSTALLED_EDITORS"
 for editor in $INSTALLED_EDITORS; do
-    # Skip empty entries
     [ -z "$editor" ] && continue
 
-    # Determine which CLI path to use based on where editor was found
+    if [ "$((SECONDS - EXTENSION_PHASE_START))" -ge "$EXTENSION_PHASE_TIMEOUT" ]; then
+        skip_remaining_editors
+        break
+    fi
+    REMAINING_EDITORS="${REMAINING_EDITORS#"$editor"}"
+    REMAINING_EDITORS="${REMAINING_EDITORS# }"
+
     if echo "$EDITOR_PATHS" | grep -q "$editor:alternative"; then
         CLI_PATH=$(get_editor_cli_path_alternative "$editor")
     else
         CLI_PATH=$(get_editor_cli_path "$editor")
     fi
-    EXT_DIR="/Users/$CURRENT_USER/$(get_editor_ext_dir "$editor")"
+    EXT_DIR="$USER_HOME/$(get_editor_ext_dir "$editor")"
 
-    # Check if CLI path was resolved
     if [ -z "$CLI_PATH" ]; then
         log_error "Unknown editor: $editor"
         exit 1
     fi
 
-    # Check if CLI exists
     if [ ! -f "$CLI_PATH" ]; then
         log_error "$editor CLI not found at $CLI_PATH"
         exit 1
@@ -235,104 +452,137 @@ for editor in $INSTALLED_EDITORS; do
 
     log_info "Installing Corridor extension for $editor..."
 
-    # Run as the logged-in user to ensure proper extension installation
-    # Capture output and exit code - "already installed" is not a failure
-    INSTALL_OUTPUT=$(sudo -u "$CURRENT_USER" "$CLI_PATH" --install-extension corridor.Corridor --force 2>&1) || true
+    # NODE_USE_SYSTEM_CA=1 adds the macOS System keychain to the editor's bundled
+    # CA list, so installs work behind TLS-intercepting proxies (Zscaler, etc.).
+    INSTALL_STATUS=0
+    run_extension_install || INSTALL_STATUS=$?
+    INSTALL_OUTPUT=$(cat "$EXTENSION_OUTPUT_FILE")
+    rm -f "$EXTENSION_OUTPUT_FILE"
+    EXTENSION_OUTPUT_FILE=""
+
+    if [ "$INSTALL_STATUS" -eq 124 ]; then
+        log_warn "Timed out installing the Corridor extension for $editor after ${INSTALL_TIMEOUT_USED}s; it will be retried on the next check-in."
+        if [ "$((SECONDS - EXTENSION_PHASE_START))" -ge "$EXTENSION_PHASE_TIMEOUT" ]; then
+            skip_remaining_editors
+            break
+        fi
+        continue
+    fi
 
     if echo "$INSTALL_OUTPUT" | grep -qi "already installed"; then
         log_info "Corridor extension is already installed for $editor"
     elif echo "$INSTALL_OUTPUT" | grep -qi "successfully installed\|was successfully installed"; then
         log_success "Corridor extension installed successfully for $editor"
     else
-        # Check if the extension directory exists as a fallback
-        if ls "$EXT_DIR" 2>/dev/null | grep -qi "corridor"; then
+        if [ -n "$(find "$EXT_DIR" -maxdepth 1 -iname "*corridor*" -print -quit 2>/dev/null)" ]; then
             log_info "Corridor extension is already installed for $editor"
         else
-            log_error "Failed to install Corridor extension for $editor: $INSTALL_OUTPUT"
+            log_error "Failed to install Corridor extension for $editor: $(redact "$INSTALL_OUTPUT")"
             exit 1
         fi
     fi
 done
 
-# Provision user and create a separate API token for each platform (each
-# installed editor plus the Corridor CLI)
+# ============================================================================
+# Provision an API token per platform
+# ============================================================================
 log_info "Provisioning user with Corridor..."
+PLATFORM_FAILURE=0
 
 for PLATFORM in $PROVISION_PLATFORMS; do
     PLATFORM_CONFIG_DIR="$CORRIDOR_CONFIG_DIR/$PLATFORM"
-    CORRIDOR_PENDING_TOKEN_FILE="$PLATFORM_CONFIG_DIR/pending-token"
 
     log_info "Creating API token for $PLATFORM..."
 
-    RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-        -H "Authorization: Bearer $CORRIDOR_TEAM_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "{\"deviceSerial\": \"$DEVICE_SERIAL\", \"userEmail\": \"$USER_EMAIL\", \"platform\": \"$PLATFORM\"}" \
-        "$CORRIDOR_API_URL/extension-auth/mdm-sync-device")
+    REQUEST_BODY=$(printf '{"deviceSerial": "%s", "userEmail": "%s", "platform": "%s"}' \
+        "$DEVICE_SERIAL" "$USER_EMAIL" "$PLATFORM")
+
+    # Token goes through a config file on stdin to keep this team-wide credential
+    # out of argv. No --retry: this call mints a token, so a retried POST would
+    # leave extra live credentials behind.
+    if ! RESPONSE=$(printf 'header = "Authorization: Bearer %s"\n' "$CORRIDOR_TEAM_TOKEN" \
+        | curl -s --config - \
+            --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 60 \
+            -w "\n%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST_BODY" \
+            "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"); then
+        log_error "Could not reach $CORRIDOR_API_URL to provision $PLATFORM"
+        exit 1
+    fi
 
     HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
     BODY=$(echo "$RESPONSE" | sed '$d')
 
     if [ "$HTTP_CODE" != "200" ]; then
-        log_error "Failed to provision token for $PLATFORM. HTTP $HTTP_CODE: $BODY"
-        exit 1
+        log_warn "Failed to provision token for $PLATFORM. HTTP $HTTP_CODE: $(redact "$BODY")"
+        PLATFORM_FAILURE=1
+        continue
     fi
 
-    # Extract API token and token ID from response
-    API_TOKEN=$(echo "$BODY" | grep -o '"apiToken":"[^"]*"' | cut -d'"' -f4)
-    API_TOKEN_ID=$(echo "$BODY" | grep -o '"apiTokenId":"[^"]*"' | cut -d'"' -f4)
+    API_TOKEN=$(printf '%s' "$BODY" | sed -n 's/.*"apiToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    API_TOKEN_ID=$(printf '%s' "$BODY" | sed -n 's/.*"apiTokenId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
     if [ -z "$API_TOKEN" ]; then
         log_error "Could not extract API token from response for $PLATFORM"
         exit 1
     fi
+    if ! is_safe_value "$API_TOKEN" || ! is_safe_value "$API_TOKEN_ID"; then
+        log_error "API token response for $PLATFORM contains unexpected characters. Refusing to store it."
+        exit 1
+    fi
 
-    # Create platform-specific config directory and write pending token file.
-    # Use umask 077 in a subshell so the directory is born 700 and the file is
-    # born 600, ensuring the API token is never world-readable on disk.
-    (
+    TOKEN_JSON=$(printf '{\n  "apiToken": "%s",\n  "apiTokenId": "%s",\n  "provisionedAt": "%s"\n}\n' \
+        "$API_TOKEN" "$API_TOKEN_ID" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")")
+
+    # Written as the target user, not root: the destination is a directory the
+    # user owns, so a root-context mkdir or redirect could be aimed anywhere via
+    # a symlink they planted. umask 077 covers creation, the chmods cover a
+    # pre-existing directory, and the token arrives on stdin to stay out of argv.
+    if ! printf '%s' "$TOKEN_JSON" | sudo -u "$CURRENT_USER" bash -c '
         umask 077
+        config_dir="$1"
+        platform_dir="$2"
+        mkdir -p "$platform_dir" || exit 1
+        chmod 700 "$config_dir" "$platform_dir" || exit 1
+        cat > "$platform_dir/pending-token" || exit 1
+        chmod 600 "$platform_dir/pending-token" || exit 1
+    ' _ "$CORRIDOR_CONFIG_DIR" "$PLATFORM_CONFIG_DIR"; then
+        log_error "Failed to store the pending token for $PLATFORM under $PLATFORM_CONFIG_DIR"
+        exit 1
+    fi
 
-        # Create platform-specific config directory with proper permissions
-        mkdir -p "$PLATFORM_CONFIG_DIR"
-
-        # Write pending token file
-        cat > "$CORRIDOR_PENDING_TOKEN_FILE" << EOF
-{
-  "apiToken": "$API_TOKEN",
-  "apiTokenId": "$API_TOKEN_ID",
-  "provisionedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-}
-EOF
-    )
-
-    chmod 700 "$PLATFORM_CONFIG_DIR"
-    chmod 600 "$CORRIDOR_PENDING_TOKEN_FILE"
-    chown -R "$CURRENT_USER" "$CORRIDOR_CONFIG_DIR"
-    log_info "Pending token for $PLATFORM stored in $CORRIDOR_PENDING_TOKEN_FILE"
+    log_info "Pending token for $PLATFORM stored in $PLATFORM_CONFIG_DIR/pending-token"
 done
 
-log_success "User provisioned successfully!"
+if [ "$PLATFORM_FAILURE" -eq 0 ]; then
+    log_success "User provisioned successfully!"
+else
+    log_warn "One or more platform token provisions failed; successful platforms were processed."
+fi
 log_info "The Corridor extension will migrate tokens to secure storage on next launch of that editor"
 
 # ============================================================================
 # Install agent plugins (Claude Code, Factory Droid, Codex)
 # ============================================================================
-# With the CLI installed and the device's "cli" token provisioned above,
-# configure the agent plugins for the user. `corridor install` migrates the
-# pending CLI token into ~/.corridor/config.env at startup and authenticates
-# from it non-interactively (--yes auto-confirms all interactive prompts). It detects which agent CLIs
-# are present in PATH (claude, droid, codex); a missing agent CLI is a non-fatal
-# no-op so it never blocks the managed rollout.
+# `corridor install` migrates the pending CLI token into ~/.corridor/config.env
+# and authenticates from it. A missing agent CLI is a non-fatal no-op.
 if [ "$CLI_INSTALLED" = "true" ]; then
     log_info "Setting up Corridor agent plugins (Claude Code, etc.) for $CURRENT_USER..."
-    if sudo -u "$CURRENT_USER" env HOME="/Users/$CURRENT_USER" \
-        PATH="/Users/$CURRENT_USER/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
-        "/Users/$CURRENT_USER/.corridor/bin/corridor" install --yes; then
+    if sudo -u "$CURRENT_USER" env HOME="$USER_HOME" \
+        PATH="$USER_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+        "$CORRIDOR_CONFIG_DIR/bin/corridor" install --yes; then
         log_success "Corridor agent plugins installed"
     else
         log_info "Corridor agent plugin setup skipped or incomplete (non-fatal — e.g. no claude/droid/codex in PATH, or install did not finish). See corridor output above for the cause."
     fi
+fi
+
+if [ "$PLATFORM_FAILURE" -ne 0 ]; then
+    log_error "Corridor provisioning completed with one or more platform token failures."
+    exit 1
 fi
 
 log_success "Corridor MDM provisioning complete!"
