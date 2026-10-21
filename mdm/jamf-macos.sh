@@ -423,10 +423,12 @@ fi
 
 skip_remaining_editors() {
     if [ -n "$REMAINING_EDITORS" ]; then
+        EXTENSION_FAILURE=1
         log_warn "Editor extension phase budget of ${EXTENSION_PHASE_TIMEOUT}s exhausted; skipping editors: $REMAINING_EDITORS. They will be retried on the next check-in."
     fi
 }
 
+EXTENSION_FAILURE=0
 EXTENSION_PHASE_START=$SECONDS
 REMAINING_EDITORS="$INSTALLED_EDITORS"
 for editor in $INSTALLED_EDITORS; do
@@ -467,6 +469,7 @@ for editor in $INSTALLED_EDITORS; do
     EXTENSION_OUTPUT_FILE=""
 
     if [ "$INSTALL_STATUS" -eq 124 ]; then
+        EXTENSION_FAILURE=1
         log_warn "Timed out installing the Corridor extension for $editor after ${INSTALL_TIMEOUT_USED}s; it will be retried on the next check-in."
         if [ "$((SECONDS - EXTENSION_PHASE_START))" -ge "$EXTENSION_PHASE_TIMEOUT" ]; then
             skip_remaining_editors
@@ -586,8 +589,8 @@ if [ "$CLI_INSTALLED" = "true" ]; then
     fi
 fi
 
-if [ "$PLATFORM_FAILURE" -ne 0 ]; then
-    log_error "Corridor provisioning completed with one or more platform token failures."
+if [ "$EXTENSION_FAILURE" -ne 0 ] || [ "$PLATFORM_FAILURE" -ne 0 ]; then
+    log_error "Corridor provisioning completed with one or more extension or platform token failures."
     exit 1
 fi
 

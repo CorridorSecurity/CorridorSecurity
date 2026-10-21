@@ -84,4 +84,6 @@ The script reads the user's email and device serial from the managed plist, mirr
 
 The four macOS scripts are generated from the templates in `src/macos/` (shared logic in `common.sh` and `prelude.sh`, MDM-specific inputs in `kandji.sh`, `jamf.sh`, `fleet.sh`, and `intune.sh`). Edit the source, then run `scripts/build.sh` to regenerate `mdm/*-macos.sh`. Do not edit the generated files by hand.
 
-Enable the pre-commit hook, which rebuilds and stages the generated files, with `git config core.hooksPath .githooks`. CI runs `scripts/build.sh --check` and fails if a generated file is stale.
+Enable the pre-commit hook, which rebuilds and stages the generated files, with `git config core.hooksPath .githooks`. Stage or stash changes to generator inputs and generated scripts before committing. The hook rejects unstaged changes and untracked generator inputs.
+
+CI runs `scripts/build.sh --check` and `python3 scripts/test_regressions.py` to check generated files and retry behavior.
