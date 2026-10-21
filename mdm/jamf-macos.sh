@@ -48,8 +48,8 @@ PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 LOG_PREFIX="[Corridor MDM]"
 CORRIDOR_API_URL="https://app.corridor.dev/api"
 CORRIDOR_CLI_INSTALL_URL="https://app.corridor.dev/cli/install.sh"
-EXTENSION_INSTALL_TIMEOUT=60
-EXTENSION_PHASE_TIMEOUT=150
+# First CLI release with `corridor mdm provision`. Older CLIs use the in-script path.
+CORRIDOR_MIN_PROVISION_VERSION="0.0.91"
 
 # The MDM agent may run from a directory the console user cannot read; use a stable
 # working directory so child processes do not emit getcwd errors.
@@ -115,42 +115,6 @@ is_safe_username() {
 # Team tokens use cor-…; minted API tokens use cor_… — both must be scrubbed.
 redact() {
     printf '%s' "$1" | tr -d '\n' | cut -c1-200 | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g'
-}
-
-kill_process_tree() {
-    local parent_pid="$1"
-    local child_pid
-    for child_pid in $(pgrep -P "$parent_pid" 2>/dev/null); do
-        kill_process_tree "$child_pid"
-    done
-    kill -TERM "$parent_pid" 2>/dev/null || true
-    kill -KILL "$parent_pid" 2>/dev/null || true
-}
-
-run_extension_install() {
-    EXTENSION_OUTPUT_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-extension.XXXXXX")
-    launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
-        env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
-        --install-extension corridor.Corridor --force \
-        > "$EXTENSION_OUTPUT_FILE" 2>&1 &
-    local install_pid=$!
-    local elapsed=0
-    local phase_remaining=$((EXTENSION_PHASE_TIMEOUT - (SECONDS - EXTENSION_PHASE_START)))
-    local install_timeout="$EXTENSION_INSTALL_TIMEOUT"
-    if [ "$phase_remaining" -lt "$install_timeout" ]; then
-        install_timeout="$phase_remaining"
-    fi
-    INSTALL_TIMEOUT_USED="$install_timeout"
-    while kill -0 "$install_pid" 2>/dev/null; do
-        if [ "$elapsed" -ge "$install_timeout" ]; then
-            kill_process_tree "$install_pid"
-            wait "$install_pid" 2>/dev/null || true
-            return 124
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-    wait "$install_pid"
 }
 if [ -z "$CORRIDOR_TEAM_TOKEN" ] || [ "$CORRIDOR_TEAM_TOKEN" = "cor-team_..." ]; then
     log_error "CORRIDOR_TEAM_TOKEN is not configured. Set your team token in the configuration section at the top of this script."
@@ -316,6 +280,189 @@ fi
 
 rm -f "$CLI_INSTALLER"
 CLI_INSTALLER=""
+
+# ============================================================================
+# Mint a per-user API token
+# ============================================================================
+# mint_platform_token <platform>: sets API_TOKEN and API_TOKEN_ID. Returns 1
+# after a warning on a non-200 so the caller can record the failure and go on.
+# An unreachable API or a response that cannot be trusted exits 1.
+mint_platform_token() {
+    local platform="$1"
+    local request_body response http_code body
+
+    log_info "Creating API token for $platform..."
+
+    request_body=$(printf '{"deviceSerial": "%s", "userEmail": "%s", "platform": "%s"}' \
+        "$DEVICE_SERIAL" "$USER_EMAIL" "$platform")
+
+    # Token goes through a config file on stdin to keep this team-wide credential
+    # out of argv. No --retry: this call mints a token, so a retried POST would
+    # leave extra live credentials behind.
+    if ! response=$(printf 'header = "Authorization: Bearer %s"\n' "$CORRIDOR_TEAM_TOKEN" \
+        | curl -s --config - \
+            --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 60 \
+            -w "\n%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$request_body" \
+            "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"); then
+        log_error "Could not reach $CORRIDOR_API_URL to provision $platform"
+        exit 1
+    fi
+
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+
+    if [ "$http_code" != "200" ]; then
+        log_warn "Failed to provision token for $platform. HTTP $http_code: $(redact "$body")"
+        return 1
+    fi
+
+    API_TOKEN=$(printf '%s' "$body" | sed -n 's/.*"apiToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    API_TOKEN_ID=$(printf '%s' "$body" | sed -n 's/.*"apiTokenId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+    if [ -z "$API_TOKEN" ]; then
+        log_error "Could not extract API token from response for $platform"
+        exit 1
+    fi
+    if ! is_safe_value "$API_TOKEN" || ! is_safe_value "$API_TOKEN_ID"; then
+        log_error "API token response for $platform contains unexpected characters. Refusing to store it."
+        exit 1
+    fi
+}
+
+# ============================================================================
+# Provision through the Corridor CLI
+# ============================================================================
+CORRIDOR_BIN="$CORRIDOR_CONFIG_DIR/bin/corridor"
+
+# version_at_least <version> <minimum>: numeric x.y.z compare. Anything that is
+# not plain digits (a dev build, a prerelease tag) fails, so it takes the
+# legacy path.
+version_at_least() {
+    local have want i
+    IFS=. read -r -a have <<< "$1"
+    IFS=. read -r -a want <<< "$2"
+    for i in 0 1 2; do
+        case "${have[$i]:-}" in ""|*[!0-9]*) return 1 ;; esac
+        [ "${have[$i]}" -gt "${want[$i]}" ] && return 0
+        [ "${have[$i]}" -lt "${want[$i]}" ] && return 1
+    done
+    return 0
+}
+
+CLI_VERSION=""
+if [ "$CLI_INSTALLED" = "true" ] && [ -x "$CORRIDOR_BIN" ]; then
+    CLI_VERSION=$(sudo -u "$CURRENT_USER" env HOME="$USER_HOME" "$CORRIDOR_BIN" --version 2>/dev/null \
+        | awk 'NR == 1 { print $NF }' || echo "")
+fi
+
+if version_at_least "$CLI_VERSION" "$CORRIDOR_MIN_PROVISION_VERSION"; then
+    log_info "Provisioning $CURRENT_USER with corridor $CLI_VERSION..."
+    # The user owns the CLI binary and could swap it, so it never sees the team
+    # token, which can mint tokens for any email on the team. Root mints each
+    # per-user token and hands the CLI only those, on stdin to stay out of argv. launchctl asuser puts the editor CLIs in the user's GUI
+    # session, as running them from Terminal would.
+    if ! PLATFORM_LIST=$(sudo -u "$CURRENT_USER" env HOME="$USER_HOME" "$CORRIDOR_BIN" mdm platforms); then
+        log_error "corridor mdm platforms failed. See its output above; the MDM will retry on a later check-in."
+        exit 1
+    fi
+
+    TOKEN_LINES=""
+    SEEN_PLATFORMS=" "
+    PLATFORM_FAILURE=0
+    while IFS= read -r PLATFORM; do
+        case "$PLATFORM" in
+            "") continue ;;
+            cursor|vscode|windsurf|cli) ;;
+            *)
+                log_warn "Ignoring unexpected platform from corridor mdm platforms: $(redact "$PLATFORM")"
+                continue
+                ;;
+        esac
+        case "$SEEN_PLATFORMS" in
+            *" $PLATFORM "*) continue ;;
+        esac
+        SEEN_PLATFORMS="$SEEN_PLATFORMS$PLATFORM "
+
+        if mint_platform_token "$PLATFORM"; then
+            # Both values passed is_safe_value, so they are safe inside JSON.
+            TOKEN_LINES="$TOKEN_LINES$(printf '{"platform":"%s","apiToken":"%s","apiTokenId":"%s"}' \
+                "$PLATFORM" "$API_TOKEN" "$API_TOKEN_ID")"$'\n'
+        else
+            PLATFORM_FAILURE=1
+        fi
+    done <<< "$PLATFORM_LIST"
+
+    if [ -z "$TOKEN_LINES" ]; then
+        log_error "No API token was minted. See the messages above; the MDM will retry on a later check-in."
+        exit 1
+    fi
+
+    if ! printf '%s' "$TOKEN_LINES" \
+        | launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" env HOME="$USER_HOME" \
+            "$CORRIDOR_BIN" mdm provision \
+            --email "$USER_EMAIL" --serial "$DEVICE_SERIAL" --api-url "$CORRIDOR_API_URL"; then
+        log_error "corridor mdm provision failed. See its output above; the MDM will retry on a later check-in."
+        exit 1
+    fi
+    if [ "$PLATFORM_FAILURE" -ne 0 ]; then
+        log_error "One or more platform token provisions failed; successful platforms were processed. The MDM will retry on a later check-in."
+        exit 1
+    fi
+    exit 0
+fi
+
+if [ "$CLI_INSTALLED" = "true" ]; then
+    log_info "Corridor CLI version '${CLI_VERSION:-unknown}' is older than $CORRIDOR_MIN_PROVISION_VERSION; using in-script provisioning."
+fi
+
+# ============================================================================
+# Legacy in-script provisioning
+# ============================================================================
+# Used when the installed CLI predates `corridor mdm provision`
+# (CORRIDOR_MIN_PROVISION_VERSION) or did not install. Remove once every
+# supported CLI release has the command.
+EXTENSION_INSTALL_TIMEOUT=60
+EXTENSION_PHASE_TIMEOUT=150
+
+kill_process_tree() {
+    local parent_pid="$1"
+    local child_pid
+    for child_pid in $(pgrep -P "$parent_pid" 2>/dev/null); do
+        kill_process_tree "$child_pid"
+    done
+    kill -TERM "$parent_pid" 2>/dev/null || true
+    kill -KILL "$parent_pid" 2>/dev/null || true
+}
+
+run_extension_install() {
+    EXTENSION_OUTPUT_FILE=$(mktemp "${TMPDIR:-/tmp}/corridor-extension.XXXXXX")
+    launchctl asuser "$CURRENT_USER_UID" sudo -u "$CURRENT_USER" \
+        env NODE_USE_SYSTEM_CA=1 "$CLI_PATH" \
+        --install-extension corridor.Corridor --force \
+        > "$EXTENSION_OUTPUT_FILE" 2>&1 &
+    local install_pid=$!
+    local elapsed=0
+    local phase_remaining=$((EXTENSION_PHASE_TIMEOUT - (SECONDS - EXTENSION_PHASE_START)))
+    local install_timeout="$EXTENSION_INSTALL_TIMEOUT"
+    if [ "$phase_remaining" -lt "$install_timeout" ]; then
+        install_timeout="$phase_remaining"
+    fi
+    INSTALL_TIMEOUT_USED="$install_timeout"
+    while kill -0 "$install_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$install_timeout" ]; then
+            kill_process_tree "$install_pid"
+            wait "$install_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$install_pid"
+}
 
 # ============================================================================
 # Detect editors and install the Corridor extension
@@ -501,46 +648,9 @@ PLATFORM_FAILURE=0
 for PLATFORM in $PROVISION_PLATFORMS; do
     PLATFORM_CONFIG_DIR="$CORRIDOR_CONFIG_DIR/$PLATFORM"
 
-    log_info "Creating API token for $PLATFORM..."
-
-    REQUEST_BODY=$(printf '{"deviceSerial": "%s", "userEmail": "%s", "platform": "%s"}' \
-        "$DEVICE_SERIAL" "$USER_EMAIL" "$PLATFORM")
-
-    # Token goes through a config file on stdin to keep this team-wide credential
-    # out of argv. No --retry: this call mints a token, so a retried POST would
-    # leave extra live credentials behind.
-    if ! RESPONSE=$(printf 'header = "Authorization: Bearer %s"\n' "$CORRIDOR_TEAM_TOKEN" \
-        | curl -s --config - \
-            --proto '=https' --tlsv1.2 \
-            --connect-timeout 15 --max-time 60 \
-            -w "\n%{http_code}" \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -d "$REQUEST_BODY" \
-            "$CORRIDOR_API_URL/extension-auth/mdm-sync-device"); then
-        log_error "Could not reach $CORRIDOR_API_URL to provision $PLATFORM"
-        exit 1
-    fi
-
-    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-    BODY=$(echo "$RESPONSE" | sed '$d')
-
-    if [ "$HTTP_CODE" != "200" ]; then
-        log_warn "Failed to provision token for $PLATFORM. HTTP $HTTP_CODE: $(redact "$BODY")"
+    if ! mint_platform_token "$PLATFORM"; then
         PLATFORM_FAILURE=1
         continue
-    fi
-
-    API_TOKEN=$(printf '%s' "$BODY" | sed -n 's/.*"apiToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    API_TOKEN_ID=$(printf '%s' "$BODY" | sed -n 's/.*"apiTokenId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-
-    if [ -z "$API_TOKEN" ]; then
-        log_error "Could not extract API token from response for $PLATFORM"
-        exit 1
-    fi
-    if ! is_safe_value "$API_TOKEN" || ! is_safe_value "$API_TOKEN_ID"; then
-        log_error "API token response for $PLATFORM contains unexpected characters. Refusing to store it."
-        exit 1
     fi
 
     TOKEN_JSON=$(printf '{\n  "apiToken": "%s",\n  "apiTokenId": "%s",\n  "provisionedAt": "%s"\n}\n' \
