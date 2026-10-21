@@ -1,4 +1,5 @@
 #!/bin/bash
+# GENERATED from src/macos/fleet.sh by scripts/build.sh - edit the source, not this file.
 #
 # Corridor MDM Provisioning Script for Fleet MacOS Devices
 #
@@ -30,17 +31,16 @@ CORRIDOR_CLI_SHA256=''
 set -e
 set -o pipefail
 
-# Fixed PATH so utilities cannot be shadowed by fleetd's root environment.
+# Fixed PATH so utilities cannot be shadowed by the MDM agent's root environment.
 PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 LOG_PREFIX="[Corridor MDM]"
 CORRIDOR_API_URL="https://app.corridor.dev/api"
 CORRIDOR_CLI_INSTALL_URL="https://app.corridor.dev/cli/install.sh"
-MANAGED_PLIST="/Library/Managed Preferences/dev.corridor.mdm.plist"
 EXTENSION_INSTALL_TIMEOUT=60
 EXTENSION_PHASE_TIMEOUT=150
 
-# Fleet may run from a directory the console user cannot read; use a stable
+# The MDM agent may run from a directory the console user cannot read; use a stable
 # working directory so child processes do not emit getcwd errors.
 cd /
 
@@ -100,7 +100,7 @@ is_safe_username() {
     esac
 }
 
-# Fleet stores script output verbatim and does not redact secrets from it.
+# MDM consoles store script output verbatim and do not redact secrets from it.
 # Team tokens use cor-…; minted API tokens use cor_… — both must be scrubbed.
 redact() {
     printf '%s' "$1" | tr -d '\n' | cut -c1-200 | sed -E 's/cor[_-][A-Za-z0-9._-]*/[redacted]/g'
@@ -177,13 +177,23 @@ if ! is_safe_value "$CORRIDOR_TEAM_TOKEN"; then
     exit 1
 fi
 
+MANAGED_PLIST="/Library/Managed Preferences/dev.corridor.mdm.plist"
+PLIST_SERIAL_KEY="SerialNumber"
+PLIST_EMAIL_KEY="UserEmail"
+PLIST_PROFILE_NAME="the Fleet configuration profile"
+PLIST_MISSING_HINT="Deploy fleet-dev.corridor.mdm.mobileconfig as a Fleet configuration profile and confirm it has been delivered to this host."
+PLIST_EMAIL_EMPTY_HINT="and that Fleet knows this host's end user"
+IDENTITY_SOURCE="$MANAGED_PLIST"
+EMAIL_SHAPE_HINT="Fleet's FLEET_VAR_HOST_END_USER_IDP_USERNAME resolves to the IdP username, which must be the user's email for Corridor provisioning."
 # ============================================================================
 # Read device configuration from the managed plist
 # ============================================================================
+# Expects MANAGED_PLIST, PLIST_SERIAL_KEY, PLIST_EMAIL_KEY, IDENTITY_SOURCE and
+# the hint variables used in the messages below.
 # MDM writes this path as root; anything else means the identity is not
 # authoritative.
 if [ -L "$MANAGED_PLIST" ] || [ ! -f "$MANAGED_PLIST" ]; then
-    log_error "Managed preferences file not found at $MANAGED_PLIST. Deploy fleet-dev.corridor.mdm.mobileconfig as a Fleet configuration profile and confirm it has been delivered to this host."
+    log_error "Managed preferences file not found at $MANAGED_PLIST. $PLIST_MISSING_HINT"
     exit 1
 fi
 
@@ -193,31 +203,37 @@ if [ "$(stat -f '%u' "$MANAGED_PLIST")" != "0" ]; then
 fi
 
 # plutil reads the file directly, bypassing cfprefsd's cached view.
-DEVICE_SERIAL=$(plutil -extract SerialNumber raw -o - "$MANAGED_PLIST" 2>/dev/null || echo "")
-USER_EMAIL=$(plutil -extract UserEmail raw -o - "$MANAGED_PLIST" 2>/dev/null || echo "")
+DEVICE_SERIAL=$(plutil -extract "$PLIST_SERIAL_KEY" raw -o - "$MANAGED_PLIST" 2>/dev/null || echo "")
+USER_EMAIL=$(plutil -extract "$PLIST_EMAIL_KEY" raw -o - "$MANAGED_PLIST" 2>/dev/null || echo "")
 
 if [ -z "$DEVICE_SERIAL" ]; then
-    log_error "Could not retrieve device serial number. Ensure the Fleet configuration profile pushes SerialNumber to $MANAGED_PLIST."
+    log_error "Could not retrieve device serial number. Ensure $PLIST_PROFILE_NAME pushes $PLIST_SERIAL_KEY to $MANAGED_PLIST."
     exit 1
 fi
+
+if [ -z "$USER_EMAIL" ]; then
+    log_error "Could not retrieve user email. Ensure $PLIST_PROFILE_NAME pushes $PLIST_EMAIL_KEY to $MANAGED_PLIST${PLIST_EMAIL_EMPTY_HINT:+, $PLIST_EMAIL_EMPTY_HINT}."
+    exit 1
+fi
+
+# ============================================================================
+# Validate device identity
+# ============================================================================
+# IDENTITY_SOURCE names where the values came from, for error messages.
 if ! is_safe_value "$DEVICE_SERIAL"; then
-    log_error "Device serial from $MANAGED_PLIST contains unexpected characters. Refusing to use it."
+    log_error "Device serial from $IDENTITY_SOURCE contains unexpected characters. Refusing to use it."
     exit 1
 fi
 log_info "Device Serial: $DEVICE_SERIAL"
 
-if [ -z "$USER_EMAIL" ]; then
-    log_error "Could not retrieve user email. Ensure the Fleet configuration profile pushes UserEmail to $MANAGED_PLIST, and that Fleet knows this host's end user."
-    exit 1
-fi
 if ! is_safe_value "$USER_EMAIL"; then
-    log_error "User email from $MANAGED_PLIST contains unexpected characters. Refusing to use it."
+    log_error "User email from $IDENTITY_SOURCE contains unexpected characters. Refusing to use it."
     exit 1
 fi
 case "$USER_EMAIL" in
     *@*.*) ;;
     *)
-        log_error "Value pushed as UserEmail ('$USER_EMAIL') is not an email address. Fleet's FLEET_VAR_HOST_END_USER_IDP_USERNAME resolves to the IdP username, which must be the user's email for Corridor provisioning."
+        log_error "User email '$USER_EMAIL' from $IDENTITY_SOURCE is not an email address.${EMAIL_SHAPE_HINT:+ $EMAIL_SHAPE_HINT}"
         exit 1
         ;;
 esac
@@ -232,7 +248,7 @@ CURRENT_USER=$(stat -f "%Su" /dev/console)
 
 case "$CURRENT_USER" in
     ""|root|_*)
-        log_error "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Corridor installs per user, so run this script while the developer is signed in. Exiting 1 so Fleet records a failure and can retry."
+        log_error "No user is signed in at the console (console owner: '${CURRENT_USER:-unknown}'). Corridor installs per user, so run this script while the developer is signed in. Exiting 1 so the MDM records a failure and retries on a later check-in."
         exit 1
         ;;
 esac
@@ -423,10 +439,12 @@ fi
 
 skip_remaining_editors() {
     if [ -n "$REMAINING_EDITORS" ]; then
+        EXTENSION_FAILURE=1
         log_warn "Editor extension phase budget of ${EXTENSION_PHASE_TIMEOUT}s exhausted; skipping editors: $REMAINING_EDITORS. They will be retried on the next check-in."
     fi
 }
 
+EXTENSION_FAILURE=0
 EXTENSION_PHASE_START=$SECONDS
 REMAINING_EDITORS="$INSTALLED_EDITORS"
 for editor in $INSTALLED_EDITORS; do
@@ -467,6 +485,7 @@ for editor in $INSTALLED_EDITORS; do
     EXTENSION_OUTPUT_FILE=""
 
     if [ "$INSTALL_STATUS" -eq 124 ]; then
+        EXTENSION_FAILURE=1
         log_warn "Timed out installing the Corridor extension for $editor after ${INSTALL_TIMEOUT_USED}s; it will be retried on the next check-in."
         if [ "$((SECONDS - EXTENSION_PHASE_START))" -ge "$EXTENSION_PHASE_TIMEOUT" ]; then
             skip_remaining_editors
@@ -480,7 +499,7 @@ for editor in $INSTALLED_EDITORS; do
     elif echo "$INSTALL_OUTPUT" | grep -qi "successfully installed\|was successfully installed"; then
         log_success "Corridor extension installed successfully for $editor"
     else
-        if ls "$EXT_DIR" 2>/dev/null | grep -qi "corridor"; then
+        if [ -n "$(find "$EXT_DIR" -maxdepth 1 -iname "*corridor*" -print -quit 2>/dev/null)" ]; then
             log_info "Corridor extension is already installed for $editor"
         else
             log_error "Failed to install Corridor extension for $editor: $(redact "$INSTALL_OUTPUT")"
@@ -586,8 +605,8 @@ if [ "$CLI_INSTALLED" = "true" ]; then
     fi
 fi
 
-if [ "$PLATFORM_FAILURE" -ne 0 ]; then
-    log_error "Corridor provisioning completed with one or more platform token failures."
+if [ "$EXTENSION_FAILURE" -ne 0 ] || [ "$PLATFORM_FAILURE" -ne 0 ]; then
+    log_error "Corridor provisioning completed with one or more extension or platform token failures."
     exit 1
 fi
 

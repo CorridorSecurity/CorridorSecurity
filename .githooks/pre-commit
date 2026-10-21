@@ -1,0 +1,36 @@
+#!/bin/bash
+# Regenerates the MDM scripts when their sources change.
+# Enable with: git config core.hooksPath .githooks
+
+set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+staged=$(git diff --cached --name-only)
+
+if ! printf '%s\n' "$staged" | grep -Eq '^(src/macos/|scripts/build\.sh$|mdm/[a-z]+-macos\.sh$)'; then
+    exit 0
+fi
+
+if ! git diff --quiet -- src/macos/ scripts/build.sh mdm/*-macos.sh; then
+    echo "pre-commit: stage or stash unstaged changes to generator inputs and generated scripts before committing." >&2
+    exit 1
+fi
+
+if [ -n "$(git ls-files --others --exclude-standard -- src/macos/ scripts/build.sh)" ]; then
+    echo "pre-commit: stage or remove untracked generator inputs before committing." >&2
+    exit 1
+fi
+
+if printf '%s\n' "$staged" | grep -Eq '^(src/macos/|scripts/build\.sh$)'; then
+    scripts/build.sh
+    git add mdm/kandji-macos.sh mdm/jamf-macos.sh mdm/fleet-macos.sh mdm/intune-macos.sh
+else
+    # A generated file changed without its source: refuse rather than rebuild
+    # over the edit.
+    if ! scripts/build.sh --check > /dev/null; then
+        echo "pre-commit: mdm/*-macos.sh are generated. Move your edit into src/macos/ and run scripts/build.sh." >&2
+        exit 1
+    fi
+fi
